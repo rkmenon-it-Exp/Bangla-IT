@@ -12,6 +12,9 @@ import android.os.Looper
 import androidx.core.app.ServiceCompat
 import com.example.data.StorePreferencesRepository
 import com.example.notifications.NotificationHelper
+import com.example.sync.ImmediateSyncWorker
+import com.example.sync.NetworkMonitor
+import com.example.sync.NotificationPoller
 import com.google.android.gms.location.FusedLocationProviderClient
 import com.google.android.gms.location.LocationCallback
 import com.google.android.gms.location.LocationRequest
@@ -23,6 +26,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 
 class LocationTrackingService : Service() {
@@ -31,7 +35,10 @@ class LocationTrackingService : Service() {
     private lateinit var fusedLocationClient: FusedLocationProviderClient
     private lateinit var repository: StorePreferencesRepository
     private lateinit var uploader: LocationUploader
+    private lateinit var notificationPoller: NotificationPoller
+    private lateinit var networkMonitor: NetworkMonitor
     private var isTrackingStarted = false
+    private var wasOnline = true
 
     private val locationCallback = object : LocationCallback() {
         override fun onLocationResult(result: LocationResult) {
@@ -48,6 +55,30 @@ class LocationTrackingService : Service() {
         fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
         repository = StorePreferencesRepository(applicationContext)
         uploader = LocationUploader(applicationContext, repository)
+        notificationPoller = NotificationPoller(applicationContext, repository)
+        networkMonitor = NetworkMonitor(applicationContext)
+        wasOnline = networkMonitor.isOnline.value
+
+        observeConnectivityForImmediateSync()
+    }
+
+    private fun observeConnectivityForImmediateSync() {
+        serviceScope.launch {
+            networkMonitor.isOnline
+                .collect { online ->
+                    if (!online) {
+                        wasOnline = false
+                        // Arm OS-level reconnect worker in case service gets stopped while offline
+                        ImmediateSyncWorker.scheduleOnReconnect(applicationContext)
+                    } else if (!wasOnline) {
+                        wasOnline = true
+                        // Back online even if UI is closed: immediately flush all pending data & sync!
+                        uploader.flushPendingLocations()
+                        fetchImmediateFix()
+                        notificationPoller.pollOnce(showSystemNotifications = true)
+                    }
+                }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -133,6 +164,7 @@ class LocationTrackingService : Service() {
 
     override fun onDestroy() {
         runCatching { fusedLocationClient.removeLocationUpdates(locationCallback) }
+        runCatching { networkMonitor.unregister() }
         isTrackingStarted = false
         serviceScope.cancel()
         super.onDestroy()

@@ -57,6 +57,7 @@ class StorePreferencesRepository(private val context: Context) {
         val LAST_ACCURACY = floatPreferencesKey("last_accuracy")
         val LAST_LOCATION_TIME = longPreferencesKey("last_location_time")
         val LAST_LOCATION_STATUS = stringPreferencesKey("last_location_status")
+        val PENDING_LOCATIONS_JSON = stringPreferencesKey("pending_locations_json")
     }
 
     val configFlow: Flow<PortalConfig> = context.banglaStoreDataStore.data.map { prefs ->
@@ -107,6 +108,11 @@ class StorePreferencesRepository(private val context: Context) {
             timestampMillis = prefs[Keys.LAST_LOCATION_TIME] ?: 0L,
             syncStatus = prefs[Keys.LAST_LOCATION_STATUS] ?: "GPS অপেক্ষমাণ (Waiting)"
         )
+    }
+
+    val pendingSyncCountFlow: Flow<Int> = context.banglaStoreDataStore.data.map { prefs ->
+        val raw = prefs[Keys.PENDING_LOCATIONS_JSON]
+        if (raw.isNullOrBlank()) 0 else runCatching { JSONArray(raw).length() }.getOrDefault(0)
     }
 
     suspend fun getConfigSnapshot(): PortalConfig = configFlow.first()
@@ -181,6 +187,50 @@ class StorePreferencesRepository(private val context: Context) {
             prefs[Keys.LAST_ACCURACY] = snapshot.accuracyMeters
             prefs[Keys.LAST_LOCATION_TIME] = snapshot.timestampMillis
             prefs[Keys.LAST_LOCATION_STATUS] = snapshot.syncStatus
+        }
+    }
+
+    suspend fun enqueuePendingLocation(payload: JSONObject) {
+        context.banglaStoreDataStore.edit { prefs ->
+            val raw = prefs[Keys.PENDING_LOCATIONS_JSON]
+            val array = if (raw.isNullOrBlank()) {
+                JSONArray()
+            } else {
+                runCatching { JSONArray(raw) }.getOrDefault(JSONArray())
+            }
+            array.put(payload)
+            // Cap queue at 200 most recent offline points
+            val trimmed = if (array.length() > 200) {
+                val next = JSONArray()
+                for (i in (array.length() - 200) until array.length()) {
+                    next.put(array.get(i))
+                }
+                next
+            } else {
+                array
+            }
+            prefs[Keys.PENDING_LOCATIONS_JSON] = trimmed.toString()
+        }
+    }
+
+    suspend fun getPendingLocations(): List<JSONObject> {
+        val raw = context.banglaStoreDataStore.data.first()[Keys.PENDING_LOCATIONS_JSON]
+        if (raw.isNullOrBlank()) return emptyList()
+        return runCatching {
+            val array = JSONArray(raw)
+            buildList {
+                for (i in 0 until array.length()) {
+                    array.optJSONObject(i)?.let { add(it) }
+                }
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    suspend fun setPendingLocations(remaining: List<JSONObject>) {
+        context.banglaStoreDataStore.edit { prefs ->
+            val array = JSONArray()
+            remaining.forEach { array.put(it) }
+            prefs[Keys.PENDING_LOCATIONS_JSON] = array.toString()
         }
     }
 

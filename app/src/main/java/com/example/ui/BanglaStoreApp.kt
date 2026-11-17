@@ -249,12 +249,15 @@ fun BanglaStoreApp(
                                         }
                                         append(" • ")
                                         append(
-                                            if (uiState.hasForegroundLocationPermission && uiState.config.gpsTrackingEnabled) {
-                                                "GPS Active"
-                                            } else {
-                                                "GPS Off"
+                                            when {
+                                                !uiState.isOnline -> "Offline"
+                                                uiState.hasForegroundLocationPermission && uiState.config.gpsTrackingEnabled -> "Online • GPS"
+                                                else -> "Online"
                                             }
                                         )
+                                        if (uiState.pendingSyncCount > 0) {
+                                            append(" (${uiState.pendingSyncCount} queued)")
+                                        }
                                     },
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -373,9 +376,14 @@ fun BanglaStoreApp(
                     PortalWebViewScreen(
                         initialUrl = uiState.config.baseUrl,
                         isVisible = isWebTab,
+                        isOnline = uiState.isOnline,
+                        pendingSyncCount = uiState.pendingSyncCount,
                         pageProgress = uiState.pageProgress,
                         canGoBack = uiState.canGoBack,
                         webError = uiState.webError,
+                        isShowingOfflineCache = uiState.isShowingOfflineCache,
+                        cachedPages = uiState.cachedPages,
+                        offlinePageCache = viewModel.offlinePageCache,
                         jsBridge = viewModel.jsBridge,
                         commands = viewModel.webViewCommands,
                         onProgressChanged = viewModel::updateWebProgress,
@@ -383,6 +391,11 @@ fun BanglaStoreApp(
                         onErrorChanged = viewModel::setWebError,
                         onSessionCookieCaptured = viewModel::onSessionCookieCaptured,
                         onLogoutUrlVisited = viewModel::onLogoutUrlVisited,
+                        onSnapshotCaptured = viewModel::saveCachedPageSnapshot,
+                        onOfflineCacheModeChanged = viewModel::setShowingOfflineCache,
+                        onSelectCachedSnapshot = viewModel::openCachedSnapshot,
+                        onShowCustomOfflineScreen = viewModel::showCustomOfflineScreen,
+                        onOpenAlerts = { viewModel.selectTab(AppTab.ALERTS) },
                         onManualRefresh = {
                             viewModel.reloadCurrentWebPage()
                             viewModel.syncNow()

@@ -8,6 +8,7 @@ import androidx.lifecycle.viewModelScope
 import com.example.data.StorePreferencesRepository
 import com.example.location.LocationPermissionHelper
 import com.example.location.LocationSyncWorker
+import com.example.location.LocationUploader
 import com.example.model.AlertFilter
 import com.example.model.AppTab
 import com.example.model.LocationSnapshot
@@ -15,9 +16,13 @@ import com.example.model.NotificationEventType
 import com.example.model.PortalConfig
 import com.example.model.StoreNotification
 import com.example.notifications.NotificationHelper
+import com.example.sync.ImmediateSyncWorker
+import com.example.sync.NetworkMonitor
 import com.example.sync.NotificationPoller
 import com.example.sync.NotificationSyncWorker
 import com.example.webview.BanglaStoreBridge
+import com.example.webview.CachedPageSnapshot
+import com.example.webview.OfflinePageCache
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -32,6 +37,7 @@ import kotlinx.coroutines.launch
 
 sealed interface WebViewCommand {
     data class LoadUrl(val url: String) : WebViewCommand
+    data class LoadHtmlSnapshot(val baseUrl: String, val html: String) : WebViewCommand
     data object Reload : WebViewCommand
     data object GoBack : WebViewCommand
 }
@@ -47,6 +53,10 @@ data class BanglaStoreUiState(
     val currentUrl: String = "",
     val canGoBack: Boolean = false,
     val webError: String? = null,
+    val isOnline: Boolean = true,
+    val pendingSyncCount: Int = 0,
+    val isShowingOfflineCache: Boolean = false,
+    val cachedPages: List<CachedPageSnapshot> = emptyList(),
     val isSyncing: Boolean = false,
     val lastSyncTimeMillis: Long = 0L,
     val lastSyncStatus: String = "সিঙ্ক প্রস্তুত (Ready)",
@@ -61,6 +71,9 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
 
     private val repository = StorePreferencesRepository(application)
     private val poller = NotificationPoller(application, repository)
+    private val locationUploader = LocationUploader(application, repository)
+    private val networkMonitor = NetworkMonitor(application)
+    val offlinePageCache = OfflinePageCache(application)
 
     private val _selectedTab = MutableStateFlow(AppTab.PORTAL)
     private var lastWebTab: AppTab = AppTab.PORTAL
@@ -69,6 +82,8 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
     private val _currentUrl = MutableStateFlow("")
     private val _canGoBack = MutableStateFlow(false)
     private val _webError = MutableStateFlow<String?>(null)
+    private val _isShowingOfflineCache = MutableStateFlow(false)
+    private val _cachedPages = MutableStateFlow(offlinePageCache.listCachedPages())
     private val _isSyncing = MutableStateFlow(false)
     private val _hasNotificationPermission = MutableStateFlow(
         NotificationHelper.hasNotificationPermission(application)
@@ -81,6 +96,8 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
     )
     private val _showBackgroundLocationDialog = MutableStateFlow(false)
     private var promptedBackgroundThisSession = false
+    private var wasOnline = networkMonitor.isOnline.value
+
     @Volatile
     var isWebInnerScrolled: Boolean = false
         private set
@@ -98,10 +115,14 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         _alertFilter,
         repository.syncStatusFlow,
         repository.locationFlow,
+        repository.pendingSyncCountFlow,
+        networkMonitor.isOnline,
         _pageProgress,
         _currentUrl,
         _canGoBack,
         _webError,
+        _isShowingOfflineCache,
+        _cachedPages,
         _isSyncing,
         _hasNotificationPermission,
         _hasForegroundLocation,
@@ -116,15 +137,20 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         @Suppress("UNCHECKED_CAST")
         val syncPair = values[4] as Pair<Long, String>
         val location = values[5] as LocationSnapshot
-        val progress = values[6] as Int
-        val currentUrl = values[7] as String
-        val canGoBack = values[8] as Boolean
-        val webError = values[9] as String?
-        val isSyncing = values[10] as Boolean
-        val hasNotifPerm = values[11] as Boolean
-        val hasFgLoc = values[12] as Boolean
-        val hasBgLoc = values[13] as Boolean
-        val showBgDialog = values[14] as Boolean
+        val pendingCount = values[6] as Int
+        val isOnline = values[7] as Boolean
+        val progress = values[8] as Int
+        val currentUrl = values[9] as String
+        val canGoBack = values[10] as Boolean
+        val webError = values[11] as String?
+        val showingOfflineCache = values[12] as Boolean
+        @Suppress("UNCHECKED_CAST")
+        val cachedList = values[13] as List<CachedPageSnapshot>
+        val isSyncing = values[14] as Boolean
+        val hasNotifPerm = values[15] as Boolean
+        val hasFgLoc = values[16] as Boolean
+        val hasBgLoc = values[17] as Boolean
+        val showBgDialog = values[18] as Boolean
 
         val filtered = when (filter) {
             AlertFilter.ALL -> allNotifications
@@ -148,6 +174,10 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
             currentUrl = currentUrl.ifBlank { config.baseUrl },
             canGoBack = canGoBack,
             webError = webError,
+            isOnline = isOnline,
+            pendingSyncCount = pendingCount,
+            isShowingOfflineCache = showingOfflineCache,
+            cachedPages = cachedList,
             isSyncing = isSyncing,
             lastSyncTimeMillis = syncPair.first,
             lastSyncStatus = syncPair.second,
@@ -231,15 +261,50 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
                 LocationPermissionHelper.startTrackingService(getApplication())
                 LocationSyncWorker.schedulePeriodicLocationSync(getApplication(), true)
             }
+            // Arm reconnect worker if there are already queued items or currently offline
+            if (!networkMonitor.isOnline.value || repository.getPendingLocations().isNotEmpty()) {
+                ImmediateSyncWorker.scheduleOnReconnect(getApplication())
+            }
         }
+        observeNetworkRecovery()
         startForegroundSyncLoop()
+    }
+
+    private fun observeNetworkRecovery() {
+        viewModelScope.launch {
+            networkMonitor.isOnline
+                .collect { online ->
+                    if (!online) {
+                        wasOnline = false
+                        ImmediateSyncWorker.scheduleOnReconnect(getApplication())
+                    } else if (!wasOnline) {
+                        wasOnline = true
+                        val flushed = locationUploader.flushPendingLocations()
+                        val hadOfflineUi = _webError.value != null || _isShowingOfflineCache.value
+                        _webError.value = null
+                        _isShowingOfflineCache.value = false
+                        if (hadOfflineUi) {
+                            _webViewCommands.tryEmit(WebViewCommand.Reload)
+                        }
+                        runPollCycle(showSnackbarOnError = false)
+                        _snackbarMessages.tryEmit(
+                            if (flushed > 0) {
+                                "অনলাইন: $flushed টি সংরক্ষিত ডেটা সিঙ্ক হয়েছে"
+                            } else {
+                                "ইন্টারনেট সংযোগ ফিরে এসেছে — অটো-সিঙ্ক সম্পন্ন"
+                            }
+                        )
+                    }
+                }
+        }
     }
 
     private fun startForegroundSyncLoop() {
         viewModelScope.launch {
             while (isActive) {
                 val config = repository.getConfigSnapshot()
-                if (config.backgroundSyncEnabled) {
+                if (config.backgroundSyncEnabled && networkMonitor.isOnline.value) {
+                    locationUploader.flushPendingLocations()
                     runPollCycle(showSnackbarOnError = false)
                 }
                 delay(30_000L)
@@ -296,6 +361,28 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         }
     }
 
+    fun saveCachedPageSnapshot(url: String, title: String, html: String) {
+        viewModelScope.launch {
+            offlinePageCache.saveSnapshot(url, title, html)
+            _cachedPages.value = offlinePageCache.listCachedPages()
+        }
+    }
+
+    fun setShowingOfflineCache(showing: Boolean) {
+        _isShowingOfflineCache.value = showing
+    }
+
+    fun openCachedSnapshot(snapshot: CachedPageSnapshot) {
+        _webError.value = null
+        _isShowingOfflineCache.value = true
+        _webViewCommands.tryEmit(WebViewCommand.LoadHtmlSnapshot(snapshot.url, snapshot.html))
+    }
+
+    fun showCustomOfflineScreen() {
+        _isShowingOfflineCache.value = false
+        _webError.value = "ইন্টারনেট সংযোগ বিচ্ছিন্ন রয়েছে (Offline)"
+    }
+
     fun selectTab(tab: AppTab) {
         _selectedTab.value = tab
         val config = uiState.value.config
@@ -331,8 +418,15 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     fun reloadCurrentWebPage() {
+        networkMonitor.refreshNow()
         _webError.value = null
-        _webViewCommands.tryEmit(WebViewCommand.Reload)
+        _isShowingOfflineCache.value = false
+        val target = _currentUrl.value.ifBlank { uiState.value.config.baseUrl }
+        if (target.startsWith("http", ignoreCase = true)) {
+            _webViewCommands.tryEmit(WebViewCommand.LoadUrl(target))
+        } else {
+            _webViewCommands.tryEmit(WebViewCommand.Reload)
+        }
     }
 
     fun navigateWebBack() {
@@ -344,7 +438,7 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     fun updateWebNavigationState(url: String?, canGoBack: Boolean) {
-        if (!url.isNullOrBlank()) {
+        if (!url.isNullOrBlank() && !url.startsWith("data:", ignoreCase = true)) {
             _currentUrl.value = url
         }
         _canGoBack.value = canGoBack
@@ -398,12 +492,19 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
 
     fun syncNow() {
         viewModelScope.launch {
+            val online = networkMonitor.refreshNow()
             val ctx = getApplication<Application>()
+            if (!online) {
+                ImmediateSyncWorker.scheduleOnReconnect(ctx)
+                _snackbarMessages.tryEmit("অফলাইন আছেন — অনলাইনে আসলেই স্বয়ংক্রিয়ভাবে সব সিঙ্ক হবে")
+                return@launch
+            }
             if (uiState.value.config.gpsTrackingEnabled &&
                 LocationPermissionHelper.hasForegroundLocationPermission(ctx)
             ) {
                 LocationPermissionHelper.startTrackingService(ctx)
             }
+            locationUploader.flushPendingLocations()
             runPollCycle(showSnackbarOnError = true)
         }
     }
@@ -444,6 +545,7 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
                 }
             }
             _webError.value = null
+            _isShowingOfflineCache.value = false
             _webViewCommands.tryEmit(WebViewCommand.LoadUrl(target))
         }
     }
@@ -504,5 +606,10 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         return notif.targetUserId.isBlank() ||
             config.userId.isBlank() ||
             notif.targetUserId.equals(config.userId, ignoreCase = true)
+    }
+
+    override fun onCleared() {
+        networkMonitor.unregister()
+        super.onCleared()
     }
 }

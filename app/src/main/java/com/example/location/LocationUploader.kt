@@ -5,7 +5,10 @@ import android.location.Location
 import android.webkit.CookieManager
 import com.example.data.StorePreferencesRepository
 import com.example.model.LocationSnapshot
+import com.example.sync.ImmediateSyncWorker
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -29,15 +32,7 @@ class LocationUploader(
     ): LocationSnapshot = withContext(Dispatchers.IO) {
         val config = repository.getConfigSnapshot()
         val now = if (location.time > 0L) location.time else System.currentTimeMillis()
-
-        val webViewCookie = runCatching {
-            CookieManager.getInstance().getCookie(config.baseUrl)
-        }.getOrNull().orEmpty()
-        val storedCookie = repository.getSessionCookie()
-        val effectiveCookie = webViewCookie.ifBlank { storedCookie }
-        if (webViewCookie.isNotBlank() && webViewCookie != storedCookie) {
-            repository.saveSessionCookie(webViewCookie)
-        }
+        val effectiveCookie = resolveEffectiveCookie(config.baseUrl)
 
         val payload = JSONObject().apply {
             put("user_id", config.userId)
@@ -53,25 +48,18 @@ class LocationUploader(
             put("is_background", isBackground)
         }
 
-        val status = try {
-            val requestBuilder = Request.Builder()
-                .url(config.locationApiUrl)
-                .header("Accept", "application/json")
-                .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
+        // First flush any previously queued offline points if possible
+        flushPendingLocations()
 
-            if (effectiveCookie.isNotBlank()) {
-                requestBuilder.header("Cookie", effectiveCookie)
+        val uploadResult = postPayload(config.locationApiUrl, effectiveCookie, payload)
+        val status = when {
+            uploadResult.success -> "সার্ভারে সিঙ্ক হয়েছে (${config.userId.ifBlank { "Session" }})"
+            uploadResult.httpCode == 404 -> "লোকেশন সংরক্ষিত (API 404 — api/location.php অপেক্ষমাণ)"
+            else -> {
+                repository.enqueuePendingLocation(payload)
+                ImmediateSyncWorker.scheduleOnReconnect(context)
+                "অফলাইনে সংরক্ষিত — অনলাইনে গেলেই সাথে সাথে সিঙ্ক হবে"
             }
-
-            client.newCall(requestBuilder.build()).execute().use { response ->
-                when {
-                    response.isSuccessful -> "সার্ভারে সিঙ্ক হয়েছে (${config.userId.ifBlank { "Session" }})"
-                    response.code == 404 -> "লোকেশন সংরক্ষিত (API 404 — api/location.php অপেক্ষমাণ)"
-                    else -> "সার্ভার রেসপন্স HTTP ${response.code}"
-                }
-            }
-        } catch (ex: Exception) {
-            "লোকেশন সংরক্ষিত (নেটওয়ার্ক ত্রুটি: ${ex.localizedMessage ?: "Offline"})"
         }
 
         val snapshot = LocationSnapshot(
@@ -83,5 +71,85 @@ class LocationUploader(
         )
         repository.saveLocationSnapshot(snapshot)
         snapshot
+    }
+
+    suspend fun flushPendingLocations(): Int = withContext(Dispatchers.IO) {
+        flushMutex.withLock {
+            val pending = repository.getPendingLocations()
+            if (pending.isEmpty()) return@withLock 0
+
+            val config = repository.getConfigSnapshot()
+            val cookie = resolveEffectiveCookie(config.baseUrl)
+            val remaining = mutableListOf<JSONObject>()
+            var uploadedCount = 0
+
+            for ((index, item) in pending.withIndex()) {
+                // Ensure latest user_id/cookie is attached if staff logged in before reconnect
+                if (item.optString("user_id").isBlank() && config.userId.isNotBlank()) {
+                    item.put("user_id", config.userId)
+                }
+                val result = postPayload(config.locationApiUrl, cookie, item)
+                if (result.success || result.httpCode == 404) {
+                    if (result.success) uploadedCount++
+                } else {
+                    // Network still down or server unreachable: keep this and subsequent items
+                    for (j in index until pending.size) {
+                        remaining.add(pending[j])
+                    }
+                    break
+                }
+            }
+
+            repository.setPendingLocations(remaining)
+            if (uploadedCount > 0) {
+                val current = repository.getLatestLocationSnapshot()
+                if (current.hasFix) {
+                    repository.saveLocationSnapshot(
+                        current.copy(syncStatus = "$uploadedCount টি অফলাইন লোকেশন সিঙ্ক সম্পন্ন")
+                    )
+                }
+            }
+            uploadedCount
+        }
+    }
+
+    private suspend fun resolveEffectiveCookie(baseUrl: String): String {
+        val webViewCookie = runCatching {
+            CookieManager.getInstance().getCookie(baseUrl)
+        }.getOrNull().orEmpty()
+        val storedCookie = repository.getSessionCookie()
+        if (webViewCookie.isNotBlank() && webViewCookie != storedCookie) {
+            repository.saveSessionCookie(webViewCookie)
+        }
+        return webViewCookie.ifBlank { storedCookie }
+    }
+
+    private fun postPayload(
+        url: String,
+        cookie: String,
+        payload: JSONObject
+    ): UploadResponse {
+        return try {
+            val requestBuilder = Request.Builder()
+                .url(url)
+                .header("Accept", "application/json")
+                .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
+
+            if (cookie.isNotBlank()) {
+                requestBuilder.header("Cookie", cookie)
+            }
+
+            client.newCall(requestBuilder.build()).execute().use { response ->
+                UploadResponse(success = response.isSuccessful, httpCode = response.code)
+            }
+        } catch (_: Exception) {
+            UploadResponse(success = false, httpCode = -1)
+        }
+    }
+
+    private data class UploadResponse(val success: Boolean, val httpCode: Int)
+
+    companion object {
+        private val flushMutex = Mutex()
     }
 }
