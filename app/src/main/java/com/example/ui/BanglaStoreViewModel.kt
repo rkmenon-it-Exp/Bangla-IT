@@ -356,6 +356,8 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
             if (!networkMonitor.isOnline.value || repository.getPendingLocations().isNotEmpty()) {
                 ImmediateSyncWorker.scheduleOnReconnect(getApplication())
             }
+            delay(3000)
+            com.example.sync.AppUpdateChecker.checkForUpdate(getApplication(), triggerNotification = true)
         }
         observeNetworkRecovery()
         startForegroundSyncLoop()

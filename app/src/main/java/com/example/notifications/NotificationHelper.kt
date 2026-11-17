@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
+import android.net.Uri
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
@@ -24,6 +25,7 @@ object NotificationHelper {
     const val CHANNEL_TASKS = "channel_staff_tasks"
     const val CHANNEL_UPDATES = "channel_task_updates"
     const val CHANNEL_GPS_TRACKING = "channel_gps_tracking"
+    const val CHANNEL_APP_UPDATES = "channel_app_updates"
 
     const val EXTRA_TARGET_URL = "extra_target_url"
     const val EXTRA_NOTIFICATION_ID = "extra_notification_id"
@@ -68,8 +70,17 @@ object NotificationHelper {
             setShowBadge(false)
         }
 
+        val appUpdateChannel = NotificationChannel(
+            CHANNEL_APP_UPDATES,
+            "App Software Updates (অ্যাপ আপডেট)",
+            NotificationManager.IMPORTANCE_HIGH
+        ).apply {
+            description = "Notifications when a new software version or APK is published on GitHub."
+            enableVibration(true)
+        }
+
         manager.createNotificationChannels(
-            listOf(attendanceChannel, taskChannel, updateChannel, gpsChannel)
+            listOf(attendanceChannel, taskChannel, updateChannel, gpsChannel, appUpdateChannel)
         )
     }
 
@@ -168,6 +179,46 @@ object NotificationHelper {
                 notification.id.hashCode(),
                 builder.build()
             )
+        }
+    }
+
+    fun showAppUpdateNotification(
+        context: Context,
+        newVersion: String,
+        downloadUrl: String,
+        releaseNotes: String = ""
+    ) {
+        ensureChannels(context)
+        if (!hasNotificationPermission(context)) return
+
+        val browserIntent = Intent(Intent.ACTION_VIEW, Uri.parse(downloadUrl)).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            context,
+            9999,
+            browserIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val noteText = if (releaseNotes.isNotBlank()) {
+            "নতুন সংস্করণ $newVersion পাওয়া গেছে:\n$releaseNotes\n\nডাউনলোড করতে ট্যাপ করুন।"
+        } else {
+            "নতুন সংস্করণ $newVersion পাওয়া গেছে। নতুন ফিচার ও বাগ ফিক্স পেতে এখনই আপডেট করুন।"
+        }
+
+        val builder = NotificationCompat.Builder(context, CHANNEL_APP_UPDATES)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setColor(0xFF0D6E5E.toInt())
+            .setContentTitle("বাংলা স্টোর নতুন আপডেট ($newVersion)")
+            .setContentText("নতুন আপডেট ইনস্টল করতে এখানে ট্যাপ করুন।")
+            .setStyle(NotificationCompat.BigTextStyle().bigText(noteText))
+            .setContentIntent(pendingIntent)
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+
+        runCatching {
+            NotificationManagerCompat.from(context).notify(9999, builder.build())
         }
     }
 }
