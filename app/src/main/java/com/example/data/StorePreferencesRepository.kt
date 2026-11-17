@@ -11,6 +11,7 @@ import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.example.model.AppTab
 import com.example.model.DEFAULT_ATTENDANCE_URL
 import com.example.model.DEFAULT_BASE_URL
 import com.example.model.DEFAULT_LOCATION_API_URL
@@ -58,6 +59,8 @@ class StorePreferencesRepository(private val context: Context) {
         val LAST_LOCATION_TIME = longPreferencesKey("last_location_time")
         val LAST_LOCATION_STATUS = stringPreferencesKey("last_location_status")
         val PENDING_LOCATIONS_JSON = stringPreferencesKey("pending_locations_json")
+        val PREVIOUS_TAB = stringPreferencesKey("previous_tab")
+        val PREVIOUS_URL = stringPreferencesKey("previous_url")
     }
 
     val configFlow: Flow<PortalConfig> = context.banglaStoreDataStore.data.map { prefs ->
@@ -83,6 +86,8 @@ class StorePreferencesRepository(private val context: Context) {
             userId = prefs[Keys.USER_ID].orEmpty(),
             userName = prefs[Keys.USER_NAME].orEmpty(),
             isLoggedIn = prefs[Keys.IS_LOGGED_IN] ?: false,
+            previousTab = AppTab.fromRoute(prefs[Keys.PREVIOUS_TAB]),
+            previousUrl = prefs[Keys.PREVIOUS_URL].orEmpty(),
             autoRefreshOnTaskComplete = prefs[Keys.AUTO_REFRESH_ON_COMPLETE] ?: true,
             backgroundSyncEnabled = prefs[Keys.BACKGROUND_SYNC_ENABLED] ?: true,
             gpsTrackingEnabled = prefs[Keys.GPS_TRACKING_ENABLED] ?: true
@@ -177,6 +182,18 @@ class StorePreferencesRepository(private val context: Context) {
             prefs[Keys.USER_ID] = ""
             prefs[Keys.USER_NAME] = ""
             prefs[Keys.SESSION_COOKIE] = ""
+        }
+    }
+
+    suspend fun savePreviousWebLocation(tab: AppTab, url: String) {
+        if (!tab.isWebTab) return
+        val cleanUrl = url.trim()
+        if (cleanUrl.isNotBlank() && !cleanUrl.startsWith("http", ignoreCase = true)) return
+        context.banglaStoreDataStore.edit { prefs ->
+            prefs[Keys.PREVIOUS_TAB] = tab.route
+            if (cleanUrl.isNotBlank()) {
+                prefs[Keys.PREVIOUS_URL] = cleanUrl
+            }
         }
     }
 

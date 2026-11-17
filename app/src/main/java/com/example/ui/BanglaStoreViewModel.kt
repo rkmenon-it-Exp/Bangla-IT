@@ -97,6 +97,8 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
     private val _showBackgroundLocationDialog = MutableStateFlow(false)
     private var promptedBackgroundThisSession = false
     private var wasOnline = networkMonitor.isOnline.value
+    private var sawLoginPage = false
+    private var pendingPostLoginRedirect = false
 
     @Volatile
     var isWebInnerScrolled: Boolean = false
@@ -201,12 +203,22 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         },
         onLoginSubmittedCallback = { userId ->
             viewModelScope.launch {
-                repository.markLoggedInUserId(userId)
+                pendingPostLoginRedirect = true
+                if (userId.isNotBlank()) {
+                    repository.markLoggedInUserId(userId)
+                }
             }
         },
         onLogoutDetectedCallback = {
             viewModelScope.launch {
+                sawLoginPage = true
+                pendingPostLoginRedirect = false
                 repository.clearLoginSession()
+            }
+        },
+        onPageReadyCallback = { url, hasLoginForm ->
+            viewModelScope.launch {
+                handleWebPageReady(url, hasLoginForm)
             }
         },
         onIncomingEventCallback = { rawNotif, shouldAutoRefresh ->
@@ -246,6 +258,85 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         },
         locationSnapshotProvider = { uiState.value.locationSnapshot }
     )
+
+    private suspend fun handleWebPageReady(url: String, hasLoginForm: Boolean) {
+        if (_isShowingOfflineCache.value ||
+            url.isBlank() ||
+            url.startsWith("data:", ignoreCase = true) ||
+            !url.startsWith("http", ignoreCase = true)
+        ) {
+            return
+        }
+
+        val isLogout = isLogoutUrl(url)
+        val isLogin = !isLogout && (hasLoginForm || isLoginUrl(url))
+
+        if (isLogout || isLogin) {
+            sawLoginPage = true
+            return
+        }
+
+        // Authenticated non-login page loaded: check if we just completed a login flow
+        if (pendingPostLoginRedirect || sawLoginPage) {
+            pendingPostLoginRedirect = false
+            sawLoginPage = false
+
+            val config = repository.getConfigSnapshot()
+            val targetTab = if (config.previousTab.isWebTab) config.previousTab else AppTab.PORTAL
+            val tabDefaultUrl = defaultUrlForTab(targetTab, config)
+            val savedPrevUrl = config.previousUrl.takeIf {
+                it.startsWith("https://", ignoreCase = true) &&
+                    !isLoginUrl(it) &&
+                    !isLogoutUrl(it)
+            }
+            val targetUrl = savedPrevUrl ?: tabDefaultUrl
+
+            val isPortalHomeAlreadyOpen = targetTab == AppTab.PORTAL &&
+                urlsEffectivelyEqual(targetUrl, config.baseUrl) &&
+                url.startsWith(config.baseUrl, ignoreCase = true)
+
+            if (!isPortalHomeAlreadyOpen &&
+                (targetTab != _selectedTab.value || !urlsEffectivelyEqual(url, targetUrl))
+            ) {
+                _selectedTab.value = targetTab
+                lastWebTab = targetTab
+                _webError.value = null
+                _isShowingOfflineCache.value = false
+                _webViewCommands.tryEmit(WebViewCommand.LoadUrl(targetUrl))
+                _snackbarMessages.tryEmit("লগইন সম্পন্ন — পূর্ববর্তী ট্যাবে (${targetTab.labelBn}) যাওয়া হচ্ছে")
+                return
+            }
+        }
+
+        // Record current authenticated web tab & URL as the previous tab for future logins
+        val activeWebTab = if (_selectedTab.value.isWebTab) _selectedTab.value else lastWebTab
+        repository.savePreviousWebLocation(activeWebTab, url)
+    }
+
+    private fun defaultUrlForTab(tab: AppTab, config: PortalConfig): String {
+        return when (tab) {
+            AppTab.ATTENDANCE -> config.attendanceUrl
+            AppTab.TASKS -> config.tasksUrl
+            AppTab.PORTAL, AppTab.ALERTS -> config.baseUrl
+        }
+    }
+
+    private fun isLoginUrl(url: String): Boolean {
+        val lower = url.lowercase()
+        return lower.contains("login") ||
+            lower.contains("signin") ||
+            lower.contains("sign-in") ||
+            lower.contains("auth.php")
+    }
+
+    private fun isLogoutUrl(url: String): Boolean {
+        val lower = url.lowercase()
+        return lower.contains("logout") || lower.contains("signout")
+    }
+
+    private fun urlsEffectivelyEqual(a: String, b: String): Boolean {
+        return a.trim().trimEnd('/').equals(b.trim().trimEnd('/'), ignoreCase = true)
+    }
 
     init {
         NotificationHelper.ensureChannels(application)
@@ -356,6 +447,8 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     fun onLogoutUrlVisited() {
+        sawLoginPage = true
+        pendingPostLoginRedirect = false
         viewModelScope.launch {
             repository.clearLoginSession()
         }
@@ -386,6 +479,11 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
     fun selectTab(tab: AppTab) {
         _selectedTab.value = tab
         val config = uiState.value.config
+        if (tab.isWebTab && lastWebTab != tab) {
+            viewModelScope.launch {
+                repository.savePreviousWebLocation(tab, defaultUrlForTab(tab, config))
+            }
+        }
         when (tab) {
             AppTab.PORTAL -> {
                 if (lastWebTab != AppTab.PORTAL || _currentUrl.value.isBlank()) {

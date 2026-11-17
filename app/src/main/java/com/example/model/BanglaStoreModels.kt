@@ -93,6 +93,8 @@ data class PortalConfig(
     val userId: String = "",
     val userName: String = "",
     val isLoggedIn: Boolean = false,
+    val previousTab: AppTab = AppTab.PORTAL,
+    val previousUrl: String = "",
     val autoRefreshOnTaskComplete: Boolean = true,
     val backgroundSyncEnabled: Boolean = true,
     val gpsTrackingEnabled: Boolean = true
@@ -106,7 +108,18 @@ enum class AppTab(
     PORTAL("portal", "পোর্টাল", "Portal"),
     ATTENDANCE("attendance", "অ্যাটেন্ডেন্স", "Attendance"),
     TASKS("tasks", "টাস্ক", "Tasks"),
-    ALERTS("alerts", "অ্যালার্ট", "Alerts")
+    ALERTS("alerts", "অ্যালার্ট", "Alerts");
+
+    val isWebTab: Boolean
+        get() = this == PORTAL || this == ATTENDANCE || this == TASKS
+
+    companion object {
+        fun fromRoute(raw: String?): AppTab {
+            return entries.firstOrNull {
+                it.route.equals(raw?.trim(), ignoreCase = true) && it.isWebTab
+            } ?: PORTAL
+        }
+    }
 }
 
 enum class AlertFilter(val labelBn: String) {

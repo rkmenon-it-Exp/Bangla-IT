@@ -11,6 +11,7 @@ class BanglaStoreBridge(
     private val onSessionDetectedCallback: (UserRole?, String?, String?) -> Unit,
     private val onLoginSubmittedCallback: (String) -> Unit,
     private val onLogoutDetectedCallback: () -> Unit,
+    private val onPageReadyCallback: (String, Boolean) -> Unit,
     private val onIncomingEventCallback: (StoreNotification, Boolean) -> Unit,
     private val onRefreshRequestedCallback: (String?) -> Unit,
     private val onInnerScrollChangedCallback: (Boolean) -> Unit,
@@ -25,14 +26,17 @@ class BanglaStoreBridge(
 
     @JavascriptInterface
     fun onLoginSubmitted(userId: String?) {
-        if (!userId.isNullOrBlank()) {
-            onLoginSubmittedCallback(userId.trim())
-        }
+        onLoginSubmittedCallback(userId.orEmpty().trim())
     }
 
     @JavascriptInterface
     fun onLogoutDetected() {
         onLogoutDetectedCallback()
+    }
+
+    @JavascriptInterface
+    fun onPageReady(url: String?, hasLoginForm: Boolean) {
+        onPageReadyCallback(url.orEmpty(), hasLoginForm)
     }
 
     @JavascriptInterface
@@ -133,8 +137,46 @@ class BanglaStoreBridge(
 
         val AUTO_HOOK_JS = """
             (function() {
-                if (window.__banglaStoreHooked) return;
-                window.__banglaStoreHooked = true;
+                function isLoginFormEl(form) {
+                    if (!form) return false;
+                    var passInputs = form.querySelectorAll('input[type="password"]');
+                    if (!passInputs || passInputs.length !== 1) return false;
+                    var passName = ((passInputs[0].getAttribute('name') || '') + ' ' + (passInputs[0].getAttribute('id') || '')).toLowerCase();
+                    if (passName.indexOf('new') !== -1 || passName.indexOf('old') !== -1 || passName.indexOf('current') !== -1 || passName.indexOf('confirm') !== -1) {
+                        return false;
+                    }
+                    var visibleInputs = form.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="checkbox"])');
+                    if (visibleInputs.length <= 4) return true;
+                    var action = (form.getAttribute('action') || '').toLowerCase();
+                    return action.indexOf('login') !== -1 || action.indexOf('signin') !== -1;
+                }
+
+                function detectLoginPage() {
+                    try {
+                        var userMeta = document.querySelector('meta[name="banglastore-user-id"]');
+                        var urlLower = (window.location.href || '').toLowerCase();
+                        if (userMeta && userMeta.content && userMeta.content.trim() !== '' && urlLower.indexOf('login') === -1) {
+                            return false;
+                        }
+                        var forms = document.querySelectorAll('form');
+                        for (var i = 0; i < forms.length; i++) {
+                            if (isLoginFormEl(forms[i])) return true;
+                        }
+                        return (urlLower.indexOf('login') !== -1 || urlLower.indexOf('signin') !== -1) &&
+                            !!document.querySelector('input[type="password"]');
+                    } catch (e) {
+                        return false;
+                    }
+                }
+
+                function extractUserIdFromForm(form) {
+                    if (!form) return '';
+                    var idInput = form.querySelector(
+                        'input[name*="user"], input[name*="id"], input[name*="email"], input[name*="phone"], input[type="email"], input[type="text"]'
+                    );
+                    return idInput && idInput.value ? idInput.value : '';
+                }
+
                 try {
                     var roleMeta = document.querySelector('meta[name="banglastore-role"]');
                     var userMeta = document.querySelector('meta[name="banglastore-user-id"]');
@@ -146,7 +188,13 @@ class BanglaStoreBridge(
                             nameMeta ? nameMeta.content : ''
                         );
                     }
+                    window.BanglaStoreBridge.onPageReady(window.location.href || '', detectLoginPage());
+                } catch (e) {}
 
+                if (window.__banglaStoreHooked) return;
+                window.__banglaStoreHooked = true;
+
+                try {
                     // Detect whether touch starts inside an already-scrolled inner container
                     document.addEventListener('touchstart', function(ev) {
                         try {
@@ -162,27 +210,26 @@ class BanglaStoreBridge(
                         } catch (e) {}
                     }, { passive: true });
 
-                    // Capture staff user_id when submitting a login form (contains password input)
+                    // Capture staff user_id when submitting a login form
                     document.addEventListener('submit', function(ev) {
                         try {
                             var form = ev.target;
-                            if (!form || !form.querySelector('input[type="password"]')) return;
-                            var idInput = form.querySelector(
-                                'input[name*="user"], input[name*="id"], input[name*="email"], input[name*="phone"], input[type="email"], input[type="text"]'
-                            );
-                            if (idInput && idInput.value) {
-                                window.BanglaStoreBridge.onLoginSubmitted(idInput.value);
-                            }
+                            if (!isLoginFormEl(form)) return;
+                            window.BanglaStoreBridge.onLoginSubmitted(extractUserIdFromForm(form));
                         } catch (e) {}
                     }, true);
 
-                    // Detect explicit user-initiated logout link/button clicks
+                    // Also detect JS/AJAX login button clicks inside a login form
                     document.addEventListener('click', function(ev) {
                         try {
-                            var target = ev.target && ev.target.closest ? ev.target.closest('a, button') : null;
+                            var target = ev.target && ev.target.closest ? ev.target.closest('a, button, input[type="submit"], input[type="button"]') : null;
                             if (!target) return;
+                            var form = target.closest ? target.closest('form') : null;
+                            if (form && isLoginFormEl(form) && (target.tagName === 'BUTTON' || target.tagName === 'INPUT')) {
+                                window.BanglaStoreBridge.onLoginSubmitted(extractUserIdFromForm(form));
+                            }
                             var href = (target.getAttribute('href') || '').toLowerCase();
-                            var text = (target.innerText || '').toLowerCase();
+                            var text = (target.innerText || target.value || '').toLowerCase();
                             if (href.indexOf('logout') !== -1 || text.indexOf('logout') !== -1 || text.indexOf('log out') !== -1) {
                                 window.BanglaStoreBridge.onLogoutDetected();
                             }

@@ -228,7 +228,9 @@ fun PortalWebViewScreen(
                     if (!url.isNullOrBlank() && url.contains("logout", ignoreCase = true)) {
                         onLogoutUrlVisited()
                     }
-                    view?.evaluateJavascript(BanglaStoreBridge.AUTO_HOOK_JS, null)
+                    if (!currentIsShowingOfflineCache) {
+                        view?.evaluateJavascript(BanglaStoreBridge.AUTO_HOOK_JS, null)
+                    }
 
                     // Save basic HTML snapshot while online so essential store/task info remains viewable offline
                     if (currentIsOnline &&
