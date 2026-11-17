@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">বাংলা স্টোর</string>
+    <string name="app_subtitle">Bangla Store Portal</string>
+    <string name="nav_portal">পোর্টাল</string>
+    <string name="nav_attendance">অ্যাটেন্ডেন্স</string>
+    <string name="nav_tasks">টাস্ক</string>
+    <string name="nav_alerts">অ্যালার্ট</string>
+    <string name="action_refresh">রিফ্রেশ করুন</string>
+    <string name="action_back">পিছনে যান</string>
+    <string name="cd_app_logo">Bangla Store logo</string>
+    <string name="cd_refresh_page">Refresh current page</string>
+    <string name="cd_notifications">Open notifications</string>
+    <string name="cd_settings">Open notification settings</string>
+    <string name="cd_banner_illustration">Store attendance and task notification illustration</string>
+</resources>

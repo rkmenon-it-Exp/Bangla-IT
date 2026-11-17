@@ -1,0 +1,6 @@
+{
+  "name": "বাংলা স্টোর",
+  "description": "Bangla Store (banglait.net/shop) hybrid Android app with role-based attendance & task notifications and automatic task refresh.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
