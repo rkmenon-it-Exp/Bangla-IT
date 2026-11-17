@@ -118,6 +118,8 @@ fun PortalWebViewScreen(
     onOpenAlerts: () -> Unit,
     onManualRefresh: () -> Unit,
     isInnerScrolledProvider: () -> Boolean,
+    useFullStoreHooks: Boolean = true,
+    tagPrefix: String = "portal",
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -229,7 +231,12 @@ fun PortalWebViewScreen(
                         onLogoutUrlVisited()
                     }
                     if (!currentIsShowingOfflineCache) {
-                        view?.evaluateJavascript(BanglaStoreBridge.AUTO_HOOK_JS, null)
+                        val hookScript = if (useFullStoreHooks) {
+                            BanglaStoreBridge.AUTO_HOOK_JS
+                        } else {
+                            BanglaStoreBridge.SCROLL_ONLY_HOOK_JS
+                        }
+                        view?.evaluateJavascript(hookScript, null)
                     }
 
                     // Save basic HTML snapshot while online so essential store/task info remains viewable offline
@@ -405,13 +412,13 @@ fun PortalWebViewScreen(
 
     Box(modifier = modifier.fillMaxSize()) {
         Column(modifier = Modifier.fillMaxSize()) {
-            AnimatedVisibility(visible = !isOnline || isShowingOfflineCache) {
+            AnimatedVisibility(visible = isVisible && (!isOnline || isShowingOfflineCache)) {
                 Surface(
                     color = MaterialTheme.colorScheme.tertiaryContainer,
                     tonalElevation = 2.dp,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .testTag("offline_cached_banner")
+                        .testTag("${tagPrefix}_offline_cached_banner")
                 ) {
                     Row(
                         modifier = Modifier
@@ -453,14 +460,14 @@ fun PortalWebViewScreen(
                         if (isShowingOfflineCache) {
                             TextButton(
                                 onClick = onShowCustomOfflineScreen,
-                                modifier = Modifier.testTag("view_offline_screen_button")
+                                modifier = Modifier.testTag("${tagPrefix}_view_offline_screen_button")
                             ) {
                                 Text("অফলাইন স্ক্রিন")
                             }
                         } else {
                             TextButton(
                                 onClick = onManualRefresh,
-                                modifier = Modifier.testTag("banner_retry_button")
+                                modifier = Modifier.testTag("${tagPrefix}_banner_retry_button")
                             ) {
                                 Text("রিট্রাই")
                             }
@@ -473,17 +480,21 @@ fun PortalWebViewScreen(
                 AndroidView(
                     factory = { swipeRefreshLayout },
                     update = { layout ->
+                        val targetVisibility = if (isVisible) View.VISIBLE else View.INVISIBLE
+                        if (layout.visibility != targetVisibility) {
+                            layout.visibility = targetVisibility
+                        }
                         if (pageProgress >= 100 && layout.isRefreshing) {
                             layout.isRefreshing = false
                         }
                     },
                     modifier = Modifier
                         .fillMaxSize()
-                        .testTag("portal_webview_swipe_refresh")
+                        .testTag("${tagPrefix}_webview_swipe_refresh")
                 )
 
                 androidx.compose.animation.AnimatedVisibility(
-                    visible = pageProgress in 1..99 && webError == null,
+                    visible = isVisible && pageProgress in 1..99 && webError == null,
                     enter = fadeIn(),
                     exit = fadeOut(),
                     modifier = Modifier.align(Alignment.TopCenter)
@@ -497,7 +508,7 @@ fun PortalWebViewScreen(
                 }
 
                 androidx.compose.animation.AnimatedVisibility(
-                    visible = pageProgress in 1..99 && webError == null,
+                    visible = isVisible && pageProgress in 1..99 && webError == null,
                     enter = fadeIn(),
                     exit = fadeOut(),
                     modifier = Modifier.align(Alignment.Center)
@@ -507,7 +518,7 @@ fun PortalWebViewScreen(
                         color = MaterialTheme.colorScheme.surface.copy(alpha = 0.94f),
                         tonalElevation = 6.dp,
                         shadowElevation = 6.dp,
-                        modifier = Modifier.testTag("webview_loading_indicator")
+                        modifier = Modifier.testTag("${tagPrefix}_webview_loading_indicator")
                     ) {
                         Column(
                             modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
@@ -529,7 +540,7 @@ fun PortalWebViewScreen(
                     }
                 }
 
-                if (webError != null) {
+                if (isVisible && webError != null) {
                     CustomOfflineScreen(
                         isOnline = isOnline,
                         pendingSyncCount = pendingSyncCount,

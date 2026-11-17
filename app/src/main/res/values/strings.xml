@@ -2,6 +2,7 @@
 <resources>
     <string name="app_name">বাংলা স্টোর</string>
     <string name="app_subtitle">Bangla Store Portal</string>
+    <string name="workspace_isp">ISP</string>
     <string name="nav_portal">পোর্টাল</string>
     <string name="nav_attendance">অ্যাটেন্ডেন্স</string>
     <string name="nav_tasks">টাস্ক</string>

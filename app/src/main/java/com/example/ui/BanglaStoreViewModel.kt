@@ -11,6 +11,8 @@ import com.example.location.LocationSyncWorker
 import com.example.location.LocationUploader
 import com.example.model.AlertFilter
 import com.example.model.AppTab
+import com.example.model.AppWorkspace
+import com.example.model.DEFAULT_ISP_URL
 import com.example.model.LocationSnapshot
 import com.example.model.NotificationEventType
 import com.example.model.PortalConfig
@@ -32,6 +34,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
@@ -42,7 +45,17 @@ sealed interface WebViewCommand {
     data object GoBack : WebViewCommand
 }
 
+data class IspWebState(
+    val hasOpened: Boolean = false,
+    val pageProgress: Int = 100,
+    val currentUrl: String = DEFAULT_ISP_URL,
+    val canGoBack: Boolean = false,
+    val webError: String? = null,
+    val isShowingOfflineCache: Boolean = false
+)
+
 data class BanglaStoreUiState(
+    val selectedWorkspace: AppWorkspace = AppWorkspace.BANGLA_STORE,
     val selectedTab: AppTab = AppTab.PORTAL,
     val config: PortalConfig = PortalConfig(),
     val notifications: List<StoreNotification> = emptyList(),
@@ -53,6 +66,7 @@ data class BanglaStoreUiState(
     val currentUrl: String = "",
     val canGoBack: Boolean = false,
     val webError: String? = null,
+    val ispState: IspWebState = IspWebState(),
     val isOnline: Boolean = true,
     val pendingSyncCount: Int = 0,
     val isShowingOfflineCache: Boolean = false,
@@ -75,6 +89,7 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
     private val networkMonitor = NetworkMonitor(application)
     val offlinePageCache = OfflinePageCache(application)
 
+    private val _selectedWorkspace = MutableStateFlow(AppWorkspace.BANGLA_STORE)
     private val _selectedTab = MutableStateFlow(AppTab.PORTAL)
     private var lastWebTab: AppTab = AppTab.PORTAL
     private val _alertFilter = MutableStateFlow(AlertFilter.ALL)
@@ -83,6 +98,7 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
     private val _canGoBack = MutableStateFlow(false)
     private val _webError = MutableStateFlow<String?>(null)
     private val _isShowingOfflineCache = MutableStateFlow(false)
+    private val _ispState = MutableStateFlow(IspWebState())
     private val _cachedPages = MutableStateFlow(offlinePageCache.listCachedPages())
     private val _isSyncing = MutableStateFlow(false)
     private val _hasNotificationPermission = MutableStateFlow(
@@ -104,13 +120,21 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
     var isWebInnerScrolled: Boolean = false
         private set
 
+    @Volatile
+    var isIspInnerScrolled: Boolean = false
+        private set
+
     private val _webViewCommands = MutableSharedFlow<WebViewCommand>(extraBufferCapacity = 16)
     val webViewCommands: SharedFlow<WebViewCommand> = _webViewCommands.asSharedFlow()
+
+    private val _ispWebViewCommands = MutableSharedFlow<WebViewCommand>(extraBufferCapacity = 16)
+    val ispWebViewCommands: SharedFlow<WebViewCommand> = _ispWebViewCommands.asSharedFlow()
 
     private val _snackbarMessages = MutableSharedFlow<String>(extraBufferCapacity = 16)
     val snackbarMessages: SharedFlow<String> = _snackbarMessages.asSharedFlow()
 
     val uiState: StateFlow<BanglaStoreUiState> = combine(
+        _selectedWorkspace,
         _selectedTab,
         repository.configFlow,
         repository.notificationsFlow,
@@ -123,6 +147,7 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         _currentUrl,
         _canGoBack,
         _webError,
+        _ispState,
         _isShowingOfflineCache,
         _cachedPages,
         _isSyncing,
@@ -131,28 +156,30 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         _hasBackgroundLocation,
         _showBackgroundLocationDialog
     ) { values ->
-        val tab = values[0] as AppTab
-        val config = values[1] as PortalConfig
+        val workspace = values[0] as AppWorkspace
+        val tab = values[1] as AppTab
+        val config = values[2] as PortalConfig
         @Suppress("UNCHECKED_CAST")
-        val allNotifications = values[2] as List<StoreNotification>
-        val filter = values[3] as AlertFilter
+        val allNotifications = values[3] as List<StoreNotification>
+        val filter = values[4] as AlertFilter
         @Suppress("UNCHECKED_CAST")
-        val syncPair = values[4] as Pair<Long, String>
-        val location = values[5] as LocationSnapshot
-        val pendingCount = values[6] as Int
-        val isOnline = values[7] as Boolean
-        val progress = values[8] as Int
-        val currentUrl = values[9] as String
-        val canGoBack = values[10] as Boolean
-        val webError = values[11] as String?
-        val showingOfflineCache = values[12] as Boolean
+        val syncPair = values[5] as Pair<Long, String>
+        val location = values[6] as LocationSnapshot
+        val pendingCount = values[7] as Int
+        val isOnline = values[8] as Boolean
+        val progress = values[9] as Int
+        val currentUrl = values[10] as String
+        val canGoBack = values[11] as Boolean
+        val webError = values[12] as String?
+        val ispState = values[13] as IspWebState
+        val showingOfflineCache = values[14] as Boolean
         @Suppress("UNCHECKED_CAST")
-        val cachedList = values[13] as List<CachedPageSnapshot>
-        val isSyncing = values[14] as Boolean
-        val hasNotifPerm = values[15] as Boolean
-        val hasFgLoc = values[16] as Boolean
-        val hasBgLoc = values[17] as Boolean
-        val showBgDialog = values[18] as Boolean
+        val cachedList = values[15] as List<CachedPageSnapshot>
+        val isSyncing = values[16] as Boolean
+        val hasNotifPerm = values[17] as Boolean
+        val hasFgLoc = values[18] as Boolean
+        val hasBgLoc = values[19] as Boolean
+        val showBgDialog = values[20] as Boolean
 
         val filtered = when (filter) {
             AlertFilter.ALL -> allNotifications
@@ -166,6 +193,7 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         }
 
         BanglaStoreUiState(
+            selectedWorkspace = workspace,
             selectedTab = tab,
             config = config,
             notifications = allNotifications,
@@ -176,6 +204,7 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
             currentUrl = currentUrl.ifBlank { config.baseUrl },
             canGoBack = canGoBack,
             webError = webError,
+            ispState = ispState,
             isOnline = isOnline,
             pendingSyncCount = pendingCount,
             isShowingOfflineCache = showingOfflineCache,
@@ -255,6 +284,27 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         },
         onInnerScrollChangedCallback = { scrolled ->
             isWebInnerScrolled = scrolled
+        },
+        locationSnapshotProvider = { uiState.value.locationSnapshot }
+    )
+
+    val ispJsBridge: BanglaStoreBridge = BanglaStoreBridge(
+        onSessionDetectedCallback = { _, _, _ -> },
+        onLoginSubmittedCallback = { _ -> },
+        onLogoutDetectedCallback = {},
+        onPageReadyCallback = { _, _ -> },
+        onIncomingEventCallback = { _, _ -> },
+        onRefreshRequestedCallback = { targetUrl ->
+            viewModelScope.launch {
+                if (targetUrl.isNullOrBlank()) {
+                    _ispWebViewCommands.tryEmit(WebViewCommand.Reload)
+                } else {
+                    _ispWebViewCommands.tryEmit(WebViewCommand.LoadUrl(targetUrl))
+                }
+            }
+        },
+        onInnerScrollChangedCallback = { scrolled ->
+            isIspInnerScrolled = scrolled
         },
         locationSnapshotProvider = { uiState.value.locationSnapshot }
     )
@@ -374,10 +424,16 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
                         wasOnline = true
                         val flushed = locationUploader.flushPendingLocations()
                         val hadOfflineUi = _webError.value != null || _isShowingOfflineCache.value
+                        val hadIspOfflineUi = _ispState.value.webError != null ||
+                            _ispState.value.isShowingOfflineCache
                         _webError.value = null
                         _isShowingOfflineCache.value = false
+                        _ispState.update { it.copy(webError = null, isShowingOfflineCache = false) }
                         if (hadOfflineUi) {
                             _webViewCommands.tryEmit(WebViewCommand.Reload)
+                        }
+                        if (hadIspOfflineUi && _ispState.value.hasOpened) {
+                            _ispWebViewCommands.tryEmit(WebViewCommand.Reload)
                         }
                         runPollCycle(showSnackbarOnError = false)
                         _snackbarMessages.tryEmit(
@@ -478,8 +534,25 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         _webError.value = "ইন্টারনেট সংযোগ বিচ্ছিন্ন রয়েছে (Offline)"
     }
 
+    fun selectWorkspace(workspace: AppWorkspace) {
+        _selectedWorkspace.value = workspace
+        if (workspace == AppWorkspace.ISP) {
+            _ispState.update { it.copy(hasOpened = true) }
+        }
+        if (_selectedTab.value == AppTab.ALERTS) {
+            _selectedTab.value = lastWebTab
+        }
+    }
+
+    fun exitAlertsScreen() {
+        _selectedTab.value = lastWebTab
+    }
+
     fun selectTab(tab: AppTab) {
         _selectedTab.value = tab
+        if (tab.isWebTab) {
+            _selectedWorkspace.value = AppWorkspace.BANGLA_STORE
+        }
         val config = uiState.value.config
         if (tab.isWebTab && lastWebTab != tab) {
             viewModelScope.launch {
@@ -517,6 +590,23 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         _alertFilter.value = filter
     }
 
+    fun reloadActiveWorkspace() {
+        if (_selectedWorkspace.value == AppWorkspace.ISP) {
+            reloadIspWebPage()
+        } else {
+            reloadCurrentWebPage()
+            syncNow()
+        }
+    }
+
+    fun navigateActiveWebBack() {
+        if (_selectedWorkspace.value == AppWorkspace.ISP) {
+            _ispWebViewCommands.tryEmit(WebViewCommand.GoBack)
+        } else {
+            navigateWebBack()
+        }
+    }
+
     fun reloadCurrentWebPage() {
         networkMonitor.refreshNow()
         _webError.value = null
@@ -526,6 +616,17 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
             _webViewCommands.tryEmit(WebViewCommand.LoadUrl(target))
         } else {
             _webViewCommands.tryEmit(WebViewCommand.Reload)
+        }
+    }
+
+    fun reloadIspWebPage() {
+        networkMonitor.refreshNow()
+        _ispState.update { it.copy(webError = null, isShowingOfflineCache = false) }
+        val target = _ispState.value.currentUrl.ifBlank { DEFAULT_ISP_URL }
+        if (target.startsWith("http", ignoreCase = true)) {
+            _ispWebViewCommands.tryEmit(WebViewCommand.LoadUrl(target))
+        } else {
+            _ispWebViewCommands.tryEmit(WebViewCommand.Reload)
         }
     }
 
@@ -546,6 +647,45 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
 
     fun setWebError(error: String?) {
         _webError.value = error
+    }
+
+    fun updateIspProgress(progress: Int) {
+        _ispState.update { it.copy(pageProgress = progress) }
+    }
+
+    fun updateIspNavigationState(url: String?, canGoBack: Boolean) {
+        _ispState.update { state ->
+            state.copy(
+                currentUrl = if (!url.isNullOrBlank() && !url.startsWith("data:", ignoreCase = true)) {
+                    url
+                } else {
+                    state.currentUrl
+                },
+                canGoBack = canGoBack
+            )
+        }
+    }
+
+    fun setIspWebError(error: String?) {
+        _ispState.update { it.copy(webError = error) }
+    }
+
+    fun setIspShowingOfflineCache(showing: Boolean) {
+        _ispState.update { it.copy(isShowingOfflineCache = showing) }
+    }
+
+    fun openIspCachedSnapshot(snapshot: CachedPageSnapshot) {
+        _ispState.update { it.copy(webError = null, isShowingOfflineCache = true) }
+        _ispWebViewCommands.tryEmit(WebViewCommand.LoadHtmlSnapshot(snapshot.url, snapshot.html))
+    }
+
+    fun showIspCustomOfflineScreen() {
+        _ispState.update {
+            it.copy(
+                isShowingOfflineCache = false,
+                webError = "ইন্টারনেট সংযোগ বিচ্ছিন্ন রয়েছে (Offline)"
+            )
+        }
     }
 
     fun toggleAutoRefresh(enabled: Boolean) {
@@ -629,6 +769,7 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         viewModelScope.launch {
             repository.markRead(notification.id)
             val target = notification.targetUrl.ifBlank { uiState.value.config.baseUrl }
+            _selectedWorkspace.value = AppWorkspace.BANGLA_STORE
             _selectedTab.value = when (notification.type) {
                 NotificationEventType.ATTENDANCE_SUBMITTED -> {
                     lastWebTab = AppTab.ATTENDANCE
@@ -677,6 +818,7 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         }
         if (!targetUrl.isNullOrBlank()) {
             val type = NotificationEventType.fromKey(eventType)
+            _selectedWorkspace.value = AppWorkspace.BANGLA_STORE
             _selectedTab.value = when (type) {
                 NotificationEventType.ATTENDANCE_SUBMITTED -> {
                     lastWebTab = AppTab.ATTENDANCE

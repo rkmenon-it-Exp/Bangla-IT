@@ -253,5 +253,27 @@ class BanglaStoreBridge(
                 } catch (err) {}
             })();
         """.trimIndent()
+
+        val SCROLL_ONLY_HOOK_JS = """
+            (function() {
+                if (window.__banglaStoreScrollHooked) return;
+                window.__banglaStoreScrollHooked = true;
+                try {
+                    document.addEventListener('touchstart', function(ev) {
+                        try {
+                            var scrolled = (window.scrollY || document.documentElement.scrollTop || 0) > 0;
+                            var el = ev.target;
+                            while (el && el !== document && !scrolled) {
+                                if (el.scrollTop && el.scrollTop > 0) {
+                                    scrolled = true;
+                                }
+                                el = el.parentElement;
+                            }
+                            window.BanglaStoreBridge.setInnerScrollActive(scrolled);
+                        } catch (e) {}
+                    }, { passive: true });
+                } catch (err) {}
+            })();
+        """.trimIndent()
     }
 }

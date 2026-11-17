@@ -7,6 +7,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -16,9 +17,11 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -31,6 +34,7 @@ import androidx.compose.material.icons.rounded.GpsFixed
 import androidx.compose.material.icons.rounded.Notifications
 import androidx.compose.material.icons.rounded.PersonPinCircle
 import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.Router
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.Storefront
 import androidx.compose.material.icons.rounded.TaskAlt
@@ -77,6 +81,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.R
 import com.example.location.LocationPermissionHelper
 import com.example.model.AppTab
+import com.example.model.AppWorkspace
+import com.example.model.DEFAULT_ISP_URL
 import com.example.ui.screens.AlertsInboxScreen
 import com.example.ui.screens.PortalWebViewScreen
 import com.example.ui.screens.SettingsBottomSheet
@@ -168,12 +174,21 @@ fun BanglaStoreApp(
         }
     }
 
-    val isWebTab = uiState.selectedTab == AppTab.PORTAL ||
-        uiState.selectedTab == AppTab.ATTENDANCE ||
-        uiState.selectedTab == AppTab.TASKS
+    val showAlertsOverlay = uiState.selectedTab == AppTab.ALERTS
+    val showBanglaStoreWeb = !showAlertsOverlay && uiState.selectedWorkspace == AppWorkspace.BANGLA_STORE
+    val showIspWeb = !showAlertsOverlay && uiState.selectedWorkspace == AppWorkspace.ISP
+    val activeCanGoBack = when {
+        showAlertsOverlay -> false
+        showIspWeb -> uiState.ispState.canGoBack
+        else -> uiState.canGoBack
+    }
 
-    BackHandler(enabled = !isWebTab) {
-        viewModel.selectTab(AppTab.PORTAL)
+    BackHandler(enabled = showAlertsOverlay) {
+        viewModel.exitAlertsScreen()
+    }
+
+    BackHandler(enabled = showIspWeb && !uiState.ispState.canGoBack) {
+        viewModel.selectWorkspace(AppWorkspace.BANGLA_STORE)
     }
 
     BoxWithConstraints(modifier = modifier.fillMaxSize()) {
@@ -184,14 +199,15 @@ fun BanglaStoreApp(
             snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
             topBar = {
                 TopAppBar(
+                    expandedHeight = 72.dp,
                     colors = TopAppBarDefaults.topAppBarColors(
                         containerColor = MaterialTheme.colorScheme.surface,
                         titleContentColor = MaterialTheme.colorScheme.onSurface
                     ),
                     navigationIcon = {
-                        if (isWebTab && uiState.canGoBack) {
+                        if (activeCanGoBack) {
                             IconButton(
-                                onClick = { viewModel.navigateWebBack() },
+                                onClick = { viewModel.navigateActiveWebBack() },
                                 modifier = Modifier.testTag("top_back_button")
                             ) {
                                 Icon(
@@ -216,13 +232,33 @@ fun BanglaStoreApp(
                         }
                     },
                     title = {
-                        Column {
-                            Text(
-                                text = stringResource(R.string.app_name),
-                                style = MaterialTheme.typography.titleMedium,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
+                        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Surface(
+                                shape = RoundedCornerShape(12.dp),
+                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f),
+                                modifier = Modifier.testTag("top_workspace_tabs")
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(3.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    TopWorkspaceTabChip(
+                                        label = stringResource(R.string.app_name),
+                                        icon = Icons.Rounded.Storefront,
+                                        selected = uiState.selectedWorkspace == AppWorkspace.BANGLA_STORE,
+                                        onClick = { viewModel.selectWorkspace(AppWorkspace.BANGLA_STORE) },
+                                        modifier = Modifier.testTag("workspace_tab_bangla_store")
+                                    )
+                                    TopWorkspaceTabChip(
+                                        label = stringResource(R.string.workspace_isp),
+                                        icon = Icons.Rounded.Router,
+                                        selected = uiState.selectedWorkspace == AppWorkspace.ISP,
+                                        onClick = { viewModel.selectWorkspace(AppWorkspace.ISP) },
+                                        modifier = Modifier.testTag("workspace_tab_isp")
+                                    )
+                                }
+                            }
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -241,11 +277,15 @@ fun BanglaStoreApp(
                                 )
                                 Text(
                                     text = buildString {
-                                        append(uiState.config.userRole.shortLabel)
-                                        if (uiState.config.userId.isNotBlank()) {
-                                            append(" (")
-                                            append(uiState.config.userId)
-                                            append(")")
+                                        if (uiState.selectedWorkspace == AppWorkspace.ISP) {
+                                            append("ISP Admin")
+                                        } else {
+                                            append(uiState.config.userRole.shortLabel)
+                                            if (uiState.config.userId.isNotBlank()) {
+                                                append(" (")
+                                                append(uiState.config.userId)
+                                                append(")")
+                                            }
                                         }
                                         append(" • ")
                                         append(
@@ -269,34 +309,7 @@ fun BanglaStoreApp(
                     },
                     actions = {
                         IconButton(
-                            onClick = { viewModel.selectTab(AppTab.ALERTS) },
-                            modifier = Modifier.testTag("top_alerts_button")
-                        ) {
-                            BadgedBox(
-                                badge = {
-                                    if (uiState.unreadCount > 0) {
-                                        Badge(
-                                            containerColor = MaterialTheme.colorScheme.tertiary,
-                                            contentColor = MaterialTheme.colorScheme.onTertiary
-                                        ) {
-                                            Text(
-                                                text = if (uiState.unreadCount > 99) "99+" else "${uiState.unreadCount}"
-                                            )
-                                        }
-                                    }
-                                }
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Rounded.Notifications,
-                                    contentDescription = stringResource(R.string.cd_notifications)
-                                )
-                            }
-                        }
-                        IconButton(
-                            onClick = {
-                                viewModel.reloadCurrentWebPage()
-                                viewModel.syncNow()
-                            },
+                            onClick = { viewModel.reloadActiveWorkspace() },
                             modifier = Modifier.testTag("top_refresh_button")
                         ) {
                             Icon(
@@ -320,7 +333,11 @@ fun BanglaStoreApp(
                 if (!useRail) {
                     NavigationBar {
                         AppTab.entries.forEach { tab ->
-                            val selected = uiState.selectedTab == tab
+                            val selected = if (tab == AppTab.ALERTS) {
+                                showAlertsOverlay
+                            } else {
+                                showBanglaStoreWeb && uiState.selectedTab == tab
+                            }
                             NavigationBarItem(
                                 selected = selected,
                                 onClick = { viewModel.selectTab(tab) },
@@ -354,7 +371,11 @@ fun BanglaStoreApp(
                     NavigationRail(modifier = Modifier.fillMaxHeight()) {
                         Spacer(modifier = Modifier.size(8.dp))
                         AppTab.entries.forEach { tab ->
-                            val selected = uiState.selectedTab == tab
+                            val selected = if (tab == AppTab.ALERTS) {
+                                showAlertsOverlay
+                            } else {
+                                showBanglaStoreWeb && uiState.selectedTab == tab
+                            }
                             NavigationRailItem(
                                 selected = selected,
                                 onClick = { viewModel.selectTab(tab) },
@@ -375,7 +396,7 @@ fun BanglaStoreApp(
                 Box(modifier = Modifier.fillMaxSize()) {
                     PortalWebViewScreen(
                         initialUrl = uiState.config.baseUrl,
-                        isVisible = isWebTab,
+                        isVisible = showBanglaStoreWeb,
                         isOnline = uiState.isOnline,
                         pendingSyncCount = uiState.pendingSyncCount,
                         pageProgress = uiState.pageProgress,
@@ -401,17 +422,53 @@ fun BanglaStoreApp(
                             viewModel.syncNow()
                         },
                         isInnerScrolledProvider = { viewModel.isWebInnerScrolled },
+                        useFullStoreHooks = true,
+                        tagPrefix = "portal",
                         modifier = Modifier
                             .fillMaxSize()
-                            .zIndex(if (isWebTab) 1f else 0f)
+                            .zIndex(if (showBanglaStoreWeb) 2f else 0f)
                     )
 
-                    if (uiState.selectedTab == AppTab.ALERTS) {
+                    if (uiState.ispState.hasOpened) {
+                        PortalWebViewScreen(
+                            initialUrl = DEFAULT_ISP_URL,
+                            isVisible = showIspWeb,
+                            isOnline = uiState.isOnline,
+                            pendingSyncCount = uiState.pendingSyncCount,
+                            pageProgress = uiState.ispState.pageProgress,
+                            canGoBack = uiState.ispState.canGoBack,
+                            webError = uiState.ispState.webError,
+                            isShowingOfflineCache = uiState.ispState.isShowingOfflineCache,
+                            cachedPages = uiState.cachedPages,
+                            offlinePageCache = viewModel.offlinePageCache,
+                            jsBridge = viewModel.ispJsBridge,
+                            commands = viewModel.ispWebViewCommands,
+                            onProgressChanged = viewModel::updateIspProgress,
+                            onNavigationChanged = viewModel::updateIspNavigationState,
+                            onErrorChanged = viewModel::setIspWebError,
+                            onSessionCookieCaptured = {},
+                            onLogoutUrlVisited = {},
+                            onSnapshotCaptured = viewModel::saveCachedPageSnapshot,
+                            onOfflineCacheModeChanged = viewModel::setIspShowingOfflineCache,
+                            onSelectCachedSnapshot = viewModel::openIspCachedSnapshot,
+                            onShowCustomOfflineScreen = viewModel::showIspCustomOfflineScreen,
+                            onOpenAlerts = { viewModel.selectTab(AppTab.ALERTS) },
+                            onManualRefresh = viewModel::reloadIspWebPage,
+                            isInnerScrolledProvider = { viewModel.isIspInnerScrolled },
+                            useFullStoreHooks = false,
+                            tagPrefix = "isp",
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .zIndex(if (showIspWeb) 2f else 0f)
+                        )
+                    }
+
+                    if (showAlertsOverlay) {
                         Surface(
                             color = MaterialTheme.colorScheme.background,
                             modifier = Modifier
                                 .fillMaxSize()
-                                .zIndex(2f)
+                                .zIndex(3f)
                         ) {
                             AlertsInboxScreen(
                                 notifications = uiState.filteredNotifications,
@@ -510,6 +567,52 @@ fun BanglaStoreApp(
             onSyncNow = viewModel::syncNow,
             onDismiss = { showSettingsSheet = false }
         )
+    }
+}
+
+@Composable
+private fun TopWorkspaceTabChip(
+    label: String,
+    icon: ImageVector,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        shape = RoundedCornerShape(9.dp),
+        color = if (selected) {
+            MaterialTheme.colorScheme.primary
+        } else {
+            MaterialTheme.colorScheme.surface.copy(alpha = 0f)
+        },
+        contentColor = if (selected) {
+            MaterialTheme.colorScheme.onPrimary
+        } else {
+            MaterialTheme.colorScheme.onSurfaceVariant
+        },
+        modifier = modifier
+            .heightIn(min = 38.dp)
+            .clip(RoundedCornerShape(9.dp))
+            .clickable(onClick = onClick)
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(5.dp)
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                modifier = Modifier.size(16.dp)
+            )
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelLarge,
+                maxLines = 1,
+                softWrap = false,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
     }
 }
 

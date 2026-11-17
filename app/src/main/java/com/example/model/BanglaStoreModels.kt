@@ -122,6 +122,14 @@ enum class AppTab(
     }
 }
 
+enum class AppWorkspace(
+    val labelBn: String,
+    val labelEn: String
+) {
+    BANGLA_STORE("বাংলা স্টোর", "Bangla Store"),
+    ISP("ISP", "ISP")
+}
+
 enum class AlertFilter(val labelBn: String) {
     ALL("সবগুলো (All)"),
     ATTENDANCE("অ্যাটেন্ডেন্স"),
@@ -131,5 +139,6 @@ enum class AlertFilter(val labelBn: String) {
 const val DEFAULT_BASE_URL = "https://banglait.net/shop"
 const val DEFAULT_ATTENDANCE_URL = "https://banglait.net/shop/dashboard.php?staff_view=attendance"
 const val DEFAULT_TASKS_URL = "https://banglait.net/shop/tasks.php"
+const val DEFAULT_ISP_URL = "https://admin.banglait.net/"
 const val DEFAULT_NOTIFICATION_API_URL = "https://banglait.net/shop/api/notifications.php"
 const val DEFAULT_LOCATION_API_URL = "https://banglait.net/shop/api/location.php"
