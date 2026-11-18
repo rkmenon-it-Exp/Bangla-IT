@@ -4,6 +4,8 @@ import android.content.Context
 import android.location.Location
 import android.webkit.CookieManager
 import com.example.data.StorePreferencesRepository
+import com.example.model.GpsCollectionMode
+import com.example.model.GpsUploadTrigger
 import com.example.model.LocationSnapshot
 import com.example.sync.ImmediateSyncWorker
 import kotlinx.coroutines.Dispatchers
@@ -26,39 +28,102 @@ class LocationUploader(
         .readTimeout(12, TimeUnit.SECONDS)
         .build()
 
-    suspend fun recordAndUpload(
+    /**
+     * Collects GPS data locally when offline (or app closed & offline) without attempting network I/O,
+     * queuing it for automatic sync when online + eligible (panel request or >= 1 hour elapsed).
+     */
+    suspend fun enqueueOfflineCollection(
         location: Location,
-        isBackground: Boolean
+        isBackground: Boolean,
+        trigger: GpsUploadTrigger = GpsUploadTrigger.HOURLY_SCHEDULE
     ): LocationSnapshot = withContext(Dispatchers.IO) {
         val config = repository.getConfigSnapshot()
         val now = if (location.time > 0L) location.time else System.currentTimeMillis()
-        val effectiveCookie = resolveEffectiveCookie(config.baseUrl)
+        val payload = buildPayload(
+            location = location,
+            isBackground = isBackground,
+            trigger = trigger,
+            requestId = "",
+            timestampMillis = now,
+            isLoggedIn = config.isLoggedIn || config.userId.isNotBlank(),
+            panelId = config.panelId,
+            userId = config.userId,
+            userName = config.userName,
+            roleKey = config.userRole.key
+        )
+        repository.markGpsUploadTime(System.currentTimeMillis())
+        repository.enqueuePendingLocation(payload)
+        ImmediateSyncWorker.scheduleOnReconnect(context)
 
-        val payload = JSONObject().apply {
-            put("user_id", config.userId)
-            put("user_name", config.userName)
-            put("role", config.userRole.key)
-            put("is_logged_in", config.isLoggedIn || config.userId.isNotBlank() || effectiveCookie.isNotBlank())
-            put("latitude", location.latitude)
-            put("longitude", location.longitude)
-            put("accuracy", location.accuracy.toDouble())
-            put("speed", if (location.hasSpeed()) location.speed.toDouble() else 0.0)
-            put("bearing", if (location.hasBearing()) location.bearing.toDouble() else 0.0)
-            put("timestamp", now)
-            put("is_background", isBackground)
+        val snapshot = LocationSnapshot(
+            latitude = location.latitude,
+            longitude = location.longitude,
+            accuracyMeters = location.accuracy,
+            timestampMillis = now,
+            syncStatus = "অফলাইনে সংরক্ষিত — অনলাইনে গেলেই নিয়মানুযায়ী সিঙ্ক হবে"
+        )
+        repository.saveLocationSnapshot(snapshot)
+        snapshot
+    }
+
+    suspend fun recordAndUpload(
+        location: Location,
+        isBackground: Boolean,
+        trigger: GpsUploadTrigger = GpsUploadTrigger.PANEL_REQUEST,
+        requestId: String = ""
+    ): LocationSnapshot = withContext(Dispatchers.IO) {
+        val config = repository.getConfigSnapshot()
+        val remote = config.remoteControl
+        if (!config.gpsTrackingEnabled ||
+            !remote.gpsEnabled ||
+            remote.gpsMode == GpsCollectionMode.OFF
+        ) {
+            return@withContext repository.getLatestLocationSnapshot()
         }
 
-        // First flush any previously queued offline points if possible
-        flushPendingLocations()
+        // Strict guard: do not upload continuous unsolicited fixes unless panel opted into CONTINUOUS mode
+        if (trigger == GpsUploadTrigger.CONTINUOUS && remote.gpsMode != GpsCollectionMode.CONTINUOUS) {
+            return@withContext repository.getLatestLocationSnapshot()
+        }
+
+        val now = if (location.time > 0L) location.time else System.currentTimeMillis()
+        val effectiveCookie = resolveEffectiveCookie(config.baseUrl)
+
+        val payload = buildPayload(
+            location = location,
+            isBackground = isBackground,
+            trigger = trigger,
+            requestId = requestId,
+            timestampMillis = now,
+            isLoggedIn = config.isLoggedIn || config.userId.isNotBlank() || effectiveCookie.isNotBlank(),
+            panelId = config.panelId,
+            userId = config.userId,
+            userName = config.userName,
+            roleKey = config.userRole.key
+        )
+
+        repository.markGpsUploadTime(System.currentTimeMillis())
+
+        // Flush any previously queued offline points first if eligible
+        flushPendingLocations(forceAll = trigger != GpsUploadTrigger.CONTINUOUS)
 
         val uploadResult = postPayload(config.locationApiUrl, effectiveCookie, payload)
+        if (uploadResult.success) {
+            repository.markGpsServerUploadTime(System.currentTimeMillis())
+        }
+
+        val triggerLabel = when (trigger) {
+            GpsUploadTrigger.PANEL_REQUEST -> "প্যানেল রিকোয়েস্টে GPS পাঠানো হয়েছে"
+            GpsUploadTrigger.HOURLY_SCHEDULE -> "১ ঘণ্টার নিয়মিত GPS পাঠানো হয়েছে"
+            GpsUploadTrigger.CONTINUOUS -> "সার্ভারে সিঙ্ক হয়েছে"
+        }
         val status = when {
-            uploadResult.success -> "সার্ভারে সিঙ্ক হয়েছে (${config.userId.ifBlank { "Session" }})"
+            uploadResult.success -> "$triggerLabel (${config.userId.ifBlank { "Session" }})"
             uploadResult.httpCode == 404 -> "লোকেশন সংরক্ষিত (API 404 — api/location.php অপেক্ষমাণ)"
             else -> {
                 repository.enqueuePendingLocation(payload)
                 ImmediateSyncWorker.scheduleOnReconnect(context)
-                "অফলাইনে সংরক্ষিত — অনলাইনে গেলেই সাথে সাথে সিঙ্ক হবে"
+                "অফলাইনে সংরক্ষিত — অনলাইনে গেলেই সিঙ্ক হবে"
             }
         }
 
@@ -73,7 +138,7 @@ class LocationUploader(
         snapshot
     }
 
-    suspend fun flushPendingLocations(): Int = withContext(Dispatchers.IO) {
+    suspend fun flushPendingLocations(forceAll: Boolean = false): Int = withContext(Dispatchers.IO) {
         flushMutex.withLock {
             val pending = repository.getPendingLocations()
             if (pending.isEmpty()) return@withLock 0
@@ -83,16 +148,37 @@ class LocationUploader(
             val remaining = mutableListOf<JSONObject>()
             var uploadedCount = 0
 
+            val now = System.currentTimeMillis()
+            val lastServerUpload = repository.getGpsReferenceUploadOrAnchorTime()
+            val intervalMs = config.remoteControl.gpsIntervalSeconds.coerceAtLeast(3600) * 1000L
+            val hourlyWindowElapsed = lastServerUpload > 0L && (now - lastServerUpload) >= (intervalMs - 90_000L)
+            val allowAllItems = forceAll ||
+                hourlyWindowElapsed ||
+                config.remoteControl.gpsMode == GpsCollectionMode.CONTINUOUS
+
             for ((index, item) in pending.withIndex()) {
-                // Ensure latest user_id/cookie is attached if staff logged in before reconnect
+                val itemTrigger = item.optString("trigger", GpsUploadTrigger.HOURLY_SCHEDULE.key)
+                val canUploadThisItem = allowAllItems ||
+                    itemTrigger.equals(GpsUploadTrigger.PANEL_REQUEST.key, ignoreCase = true)
+
+                if (!canUploadThisItem) {
+                    remaining.add(item)
+                    continue
+                }
+
+                if (item.optString("panel_id").isBlank() && config.panelId.isNotBlank()) {
+                    item.put("panel_id", config.panelId)
+                }
                 if (item.optString("user_id").isBlank() && config.userId.isNotBlank()) {
                     item.put("user_id", config.userId)
                 }
                 val result = postPayload(config.locationApiUrl, cookie, item)
                 if (result.success || result.httpCode == 404) {
-                    if (result.success) uploadedCount++
+                    if (result.success) {
+                        uploadedCount++
+                        repository.markGpsServerUploadTime(System.currentTimeMillis())
+                    }
                 } else {
-                    // Network still down or server unreachable: keep this and subsequent items
                     for (j in index until pending.size) {
                         remaining.add(pending[j])
                     }
@@ -110,6 +196,38 @@ class LocationUploader(
                 }
             }
             uploadedCount
+        }
+    }
+
+    private fun buildPayload(
+        location: Location,
+        isBackground: Boolean,
+        trigger: GpsUploadTrigger,
+        requestId: String,
+        timestampMillis: Long,
+        isLoggedIn: Boolean,
+        panelId: String,
+        userId: String,
+        userName: String,
+        roleKey: String
+    ): JSONObject {
+        return JSONObject().apply {
+            put("panel_id", panelId)
+            put("user_id", userId)
+            put("user_name", userName)
+            put("role", roleKey)
+            put("is_logged_in", isLoggedIn)
+            put("latitude", location.latitude)
+            put("longitude", location.longitude)
+            put("accuracy", location.accuracy.toDouble())
+            put("speed", if (location.hasSpeed()) location.speed.toDouble() else 0.0)
+            put("bearing", if (location.hasBearing()) location.bearing.toDouble() else 0.0)
+            put("timestamp", timestampMillis)
+            put("is_background", isBackground)
+            put("trigger", trigger.key)
+            if (requestId.isNotBlank()) {
+                put("request_id", requestId.trim())
+            }
         }
     }
 

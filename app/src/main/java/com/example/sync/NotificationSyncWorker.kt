@@ -19,6 +19,11 @@ class NotificationSyncWorker(
 
     override suspend fun doWork(): Result {
         val repository = StorePreferencesRepository(applicationContext)
+        RemoteConfigSyncer(applicationContext, repository).syncConfig()
+        val config = repository.getConfigSnapshot()
+        if (!config.backgroundSyncEnabled || !config.remoteControl.backgroundSyncEnabled) {
+            return Result.success()
+        }
         val poller = NotificationPoller(applicationContext, repository)
         val outcome = poller.pollOnce(showSystemNotifications = true)
         return if (outcome.success) Result.success() else Result.retry()

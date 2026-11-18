@@ -8,6 +8,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -17,22 +19,39 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.systemBarsPadding
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.outlined.Dashboard
+import androidx.compose.material.icons.outlined.Group
+import androidx.compose.material.icons.outlined.Language
 import androidx.compose.material.icons.outlined.Notifications
 import androidx.compose.material.icons.outlined.PersonPinCircle
+import androidx.compose.material.icons.outlined.ReceiptLong
+import androidx.compose.material.icons.outlined.Router
 import androidx.compose.material.icons.outlined.Storefront
 import androidx.compose.material.icons.outlined.TaskAlt
+import androidx.compose.material.icons.rounded.AutoAwesome
+import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.Dashboard
+import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.GpsFixed
+import androidx.compose.material.icons.rounded.GpsOff
+import androidx.compose.material.icons.rounded.Group
+import androidx.compose.material.icons.rounded.Language
 import androidx.compose.material.icons.rounded.Notifications
 import androidx.compose.material.icons.rounded.PersonPinCircle
+import androidx.compose.material.icons.rounded.ReceiptLong
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Router
 import androidx.compose.material.icons.rounded.Settings
@@ -42,7 +61,10 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.Button
+import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FloatingActionButton
+import androidx.compose.material3.FloatingActionButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -50,6 +72,7 @@ import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationRail
 import androidx.compose.material3.NavigationRailItem
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
@@ -61,6 +84,7 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -74,15 +98,18 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.R
 import com.example.location.LocationPermissionHelper
-import com.example.model.AppTab
 import com.example.model.AppWorkspace
-import com.example.model.DEFAULT_ISP_URL
+import com.example.model.GpsCollectionMode
+import com.example.model.RemoteBottomTab
+import com.example.ui.screens.AiAssistantBottomSheet
 import com.example.ui.screens.AlertsInboxScreen
 import com.example.ui.screens.PortalWebViewScreen
 import com.example.ui.screens.SettingsBottomSheet
@@ -96,10 +123,12 @@ fun BanglaStoreApp(
 ) {
     val context = LocalContext.current
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+    val aiState by viewModel.aiState.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
     val coroutineScope = rememberCoroutineScope()
     var askedInitialPermissions by remember { mutableStateOf(false) }
     var showSettingsSheet by remember { mutableStateOf(false) }
+    var showAiAssistantSheet by remember { mutableStateOf(false) }
 
     val initialPermissionsLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
@@ -174,21 +203,51 @@ fun BanglaStoreApp(
         }
     }
 
-    val showAlertsOverlay = uiState.selectedTab == AppTab.ALERTS
-    val showBanglaStoreWeb = !showAlertsOverlay && uiState.selectedWorkspace == AppWorkspace.BANGLA_STORE
-    val showIspWeb = !showAlertsOverlay && uiState.selectedWorkspace == AppWorkspace.ISP
-    val activeCanGoBack = when {
-        showAlertsOverlay -> false
-        showIspWeb -> uiState.ispState.canGoBack
-        else -> uiState.canGoBack
+    val showAlertsOverlay = uiState.isAlertsOverlayVisible
+    val activeWorkspace = uiState.activeWorkspaceTab
+    val primaryStoreTab = uiState.primaryStoreTab
+    val isPrimaryWorkspaceActive = !showAlertsOverlay && activeWorkspace.isPrimaryStore
+    val activeSecondaryState = if (!activeWorkspace.isPrimaryStore) {
+        uiState.secondaryWebStates[activeWorkspace.id]
+    } else {
+        null
     }
 
-    BackHandler(enabled = showAlertsOverlay) {
+    val activeCanGoBack = when {
+        showAlertsOverlay -> false
+        activeWorkspace.isPrimaryStore -> uiState.canGoBack
+        else -> activeSecondaryState?.canGoBack ?: false
+    }
+
+    val gpsRequiredByPanel = uiState.config.remoteControl.gpsEnabled &&
+        uiState.config.remoteControl.gpsMode != GpsCollectionMode.OFF
+    val isGpsBlocked = gpsRequiredByPanel && (
+        !uiState.hasForegroundLocationPermission ||
+            !uiState.isDeviceGpsEnabled ||
+            !uiState.config.gpsTrackingEnabled
+        )
+
+    LaunchedEffect(isGpsBlocked) {
+        if (isGpsBlocked) {
+            showSettingsSheet = false
+            showAiAssistantSheet = false
+        }
+    }
+
+    BackHandler(enabled = isGpsBlocked) {
+        // Block navigating away from mandatory GPS prompt until GPS is enabled
+    }
+
+    BackHandler(enabled = !isGpsBlocked && showAlertsOverlay) {
         viewModel.exitAlertsScreen()
     }
 
-    BackHandler(enabled = showIspWeb && !uiState.ispState.canGoBack) {
-        viewModel.selectWorkspace(AppWorkspace.BANGLA_STORE)
+    BackHandler(enabled = !isGpsBlocked && !showAlertsOverlay && !activeWorkspace.isPrimaryStore && !activeCanGoBack) {
+        viewModel.selectPrimaryWorkspace()
+    }
+
+    val bottomNavTabs = remember(uiState.visibleBottomTabs) {
+        uiState.visibleBottomTabs.take(5)
     }
 
     BoxWithConstraints(modifier = modifier.fillMaxSize()) {
@@ -197,6 +256,22 @@ fun BanglaStoreApp(
         Scaffold(
             contentWindowInsets = WindowInsets.safeDrawing,
             snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
+            floatingActionButton = {
+                if (!showAiAssistantSheet && !showSettingsSheet) {
+                    FloatingActionButton(
+                        onClick = { showAiAssistantSheet = true },
+                        containerColor = MaterialTheme.colorScheme.tertiary,
+                        contentColor = MaterialTheme.colorScheme.onTertiary,
+                        elevation = FloatingActionButtonDefaults.elevation(defaultElevation = 4.dp),
+                        modifier = Modifier.testTag("ai_assistant_fab")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.AutoAwesome,
+                            contentDescription = stringResource(R.string.cd_ai_assistant)
+                        )
+                    }
+                }
+            },
             topBar = {
                 TopAppBar(
                     expandedHeight = 72.dp,
@@ -239,36 +314,40 @@ fun BanglaStoreApp(
                                 modifier = Modifier.testTag("top_workspace_tabs")
                             ) {
                                 Row(
-                                    modifier = Modifier.padding(3.dp),
+                                    modifier = Modifier
+                                        .horizontalScroll(rememberScrollState())
+                                        .padding(3.dp),
                                     horizontalArrangement = Arrangement.spacedBy(4.dp),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    TopWorkspaceTabChip(
-                                        label = stringResource(R.string.app_name),
-                                        icon = Icons.Rounded.Storefront,
-                                        selected = uiState.selectedWorkspace == AppWorkspace.BANGLA_STORE,
-                                        onClick = { viewModel.selectWorkspace(AppWorkspace.BANGLA_STORE) },
-                                        modifier = Modifier.testTag("workspace_tab_bangla_store")
-                                    )
-                                    TopWorkspaceTabChip(
-                                        label = stringResource(R.string.workspace_isp),
-                                        icon = Icons.Rounded.Router,
-                                        selected = uiState.selectedWorkspace == AppWorkspace.ISP,
-                                        onClick = { viewModel.selectWorkspace(AppWorkspace.ISP) },
-                                        modifier = Modifier.testTag("workspace_tab_isp")
-                                    )
+                                    uiState.visibleTopTabs.forEach { topTab ->
+                                        TopWorkspaceTabChip(
+                                            label = topTab.label,
+                                            icon = resolveTabIcon(
+                                                iconKey = topTab.icon,
+                                                selected = uiState.selectedWorkspaceId == topTab.id
+                                            ),
+                                            selected = uiState.selectedWorkspaceId == topTab.id,
+                                            onClick = { viewModel.selectWorkspace(topTab) },
+                                            modifier = Modifier.testTag("workspace_tab_${topTab.id}")
+                                        )
+                                    }
                                 }
                             }
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(6.dp)
                             ) {
+                                val gpsActive = uiState.hasForegroundLocationPermission &&
+                                    uiState.isDeviceGpsEnabled &&
+                                    uiState.config.gpsTrackingEnabled &&
+                                    uiState.config.remoteControl.gpsEnabled
                                 Box(
                                     modifier = Modifier
                                         .size(7.dp)
                                         .clip(CircleShape)
                                         .background(
-                                            if (uiState.hasForegroundLocationPermission && uiState.config.gpsTrackingEnabled) {
+                                            if (gpsActive) {
                                                 MaterialTheme.colorScheme.primary
                                             } else {
                                                 MaterialTheme.colorScheme.tertiary
@@ -277,8 +356,8 @@ fun BanglaStoreApp(
                                 )
                                 Text(
                                     text = buildString {
-                                        if (uiState.selectedWorkspace == AppWorkspace.ISP) {
-                                            append("ISP Admin")
+                                        if (!activeWorkspace.isPrimaryStore) {
+                                            append(activeWorkspace.label)
                                         } else {
                                             append(uiState.config.userRole.shortLabel)
                                             if (uiState.config.userId.isNotBlank()) {
@@ -287,11 +366,17 @@ fun BanglaStoreApp(
                                                 append(")")
                                             }
                                         }
+                                        val panelBadge = uiState.config.remoteControl.panelName
+                                            .ifBlank { uiState.config.panelId }
+                                        if (panelBadge.isNotBlank()) {
+                                            append(" • ")
+                                            append(panelBadge)
+                                        }
                                         append(" • ")
                                         append(
                                             when {
                                                 !uiState.isOnline -> "Offline"
-                                                uiState.hasForegroundLocationPermission && uiState.config.gpsTrackingEnabled -> "Online • GPS"
+                                                gpsActive -> "Online • GPS"
                                                 else -> "Online"
                                             }
                                         )
@@ -332,17 +417,17 @@ fun BanglaStoreApp(
             bottomBar = {
                 if (!useRail) {
                     NavigationBar {
-                        AppTab.entries.forEach { tab ->
-                            val selected = if (tab == AppTab.ALERTS) {
+                        bottomNavTabs.forEach { tab ->
+                            val selected = if (tab.type == "alerts") {
                                 showAlertsOverlay
                             } else {
-                                showBanglaStoreWeb && uiState.selectedTab == tab
+                                isPrimaryWorkspaceActive && uiState.selectedBottomTabId == tab.id
                             }
                             NavigationBarItem(
                                 selected = selected,
-                                onClick = { viewModel.selectTab(tab) },
+                                onClick = { viewModel.selectBottomTab(tab) },
                                 icon = {
-                                    TabIconWithBadge(
+                                    BottomTabIconWithBadge(
                                         tab = tab,
                                         selected = selected,
                                         unreadCount = uiState.unreadCount
@@ -350,12 +435,12 @@ fun BanglaStoreApp(
                                 },
                                 label = {
                                     Text(
-                                        text = tab.labelBn,
+                                        text = tab.label,
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis
                                     )
                                 },
-                                modifier = Modifier.testTag("nav_tab_${tab.route}")
+                                modifier = Modifier.testTag("nav_tab_${tab.id}")
                             )
                         }
                     }
@@ -370,98 +455,122 @@ fun BanglaStoreApp(
                 if (useRail) {
                     NavigationRail(modifier = Modifier.fillMaxHeight()) {
                         Spacer(modifier = Modifier.size(8.dp))
-                        AppTab.entries.forEach { tab ->
-                            val selected = if (tab == AppTab.ALERTS) {
+                        bottomNavTabs.forEach { tab ->
+                            val selected = if (tab.type == "alerts") {
                                 showAlertsOverlay
                             } else {
-                                showBanglaStoreWeb && uiState.selectedTab == tab
+                                isPrimaryWorkspaceActive && uiState.selectedBottomTabId == tab.id
                             }
                             NavigationRailItem(
                                 selected = selected,
-                                onClick = { viewModel.selectTab(tab) },
+                                onClick = { viewModel.selectBottomTab(tab) },
                                 icon = {
-                                    TabIconWithBadge(
+                                    BottomTabIconWithBadge(
                                         tab = tab,
                                         selected = selected,
                                         unreadCount = uiState.unreadCount
                                     )
                                 },
-                                label = { Text(tab.labelBn) },
-                                modifier = Modifier.testTag("rail_tab_${tab.route}")
+                                label = { Text(tab.label) },
+                                modifier = Modifier.testTag("rail_tab_${tab.id}")
                             )
                         }
                     }
                 }
 
                 Box(modifier = Modifier.fillMaxSize()) {
-                    PortalWebViewScreen(
-                        initialUrl = uiState.config.baseUrl,
-                        isVisible = showBanglaStoreWeb,
-                        isOnline = uiState.isOnline,
-                        pendingSyncCount = uiState.pendingSyncCount,
-                        pageProgress = uiState.pageProgress,
-                        canGoBack = uiState.canGoBack,
-                        webError = uiState.webError,
-                        isShowingOfflineCache = uiState.isShowingOfflineCache,
-                        cachedPages = uiState.cachedPages,
-                        offlinePageCache = viewModel.offlinePageCache,
-                        jsBridge = viewModel.jsBridge,
-                        commands = viewModel.webViewCommands,
-                        onProgressChanged = viewModel::updateWebProgress,
-                        onNavigationChanged = viewModel::updateWebNavigationState,
-                        onErrorChanged = viewModel::setWebError,
-                        onSessionCookieCaptured = viewModel::onSessionCookieCaptured,
-                        onLogoutUrlVisited = viewModel::onLogoutUrlVisited,
-                        onSnapshotCaptured = viewModel::saveCachedPageSnapshot,
-                        onOfflineCacheModeChanged = viewModel::setShowingOfflineCache,
-                        onSelectCachedSnapshot = viewModel::openCachedSnapshot,
-                        onShowCustomOfflineScreen = viewModel::showCustomOfflineScreen,
-                        onOpenAlerts = { viewModel.selectTab(AppTab.ALERTS) },
-                        onManualRefresh = {
-                            viewModel.reloadCurrentWebPage()
-                            viewModel.syncNow()
-                        },
-                        isInnerScrolledProvider = { viewModel.isWebInnerScrolled },
-                        useFullStoreHooks = true,
-                        tagPrefix = "portal",
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .zIndex(if (showBanglaStoreWeb) 2f else 0f)
-                    )
-
-                    if (uiState.ispState.hasOpened) {
+                    // Primary workspace WebView (always alive)
+                    key(primaryStoreTab.id) {
+                        val primaryVisible = !showAlertsOverlay &&
+                            uiState.selectedWorkspaceId == primaryStoreTab.id
                         PortalWebViewScreen(
-                            initialUrl = DEFAULT_ISP_URL,
-                            isVisible = showIspWeb,
+                            initialUrl = primaryStoreTab.url.ifBlank { uiState.config.baseUrl },
+                            isVisible = primaryVisible,
                             isOnline = uiState.isOnline,
                             pendingSyncCount = uiState.pendingSyncCount,
-                            pageProgress = uiState.ispState.pageProgress,
-                            canGoBack = uiState.ispState.canGoBack,
-                            webError = uiState.ispState.webError,
-                            isShowingOfflineCache = uiState.ispState.isShowingOfflineCache,
+                            pageProgress = uiState.pageProgress,
+                            canGoBack = uiState.canGoBack,
+                            webError = uiState.webError,
+                            isShowingOfflineCache = uiState.isShowingOfflineCache,
                             cachedPages = uiState.cachedPages,
                             offlinePageCache = viewModel.offlinePageCache,
-                            jsBridge = viewModel.ispJsBridge,
-                            commands = viewModel.ispWebViewCommands,
-                            onProgressChanged = viewModel::updateIspProgress,
-                            onNavigationChanged = viewModel::updateIspNavigationState,
-                            onErrorChanged = viewModel::setIspWebError,
-                            onSessionCookieCaptured = {},
-                            onLogoutUrlVisited = {},
+                            jsBridge = viewModel.jsBridge,
+                            commands = viewModel.webViewCommands,
+                            onProgressChanged = viewModel::updateWebProgress,
+                            onNavigationChanged = viewModel::updateWebNavigationState,
+                            onErrorChanged = viewModel::setWebError,
+                            onSessionCookieCaptured = viewModel::onSessionCookieCaptured,
+                            onLogoutUrlVisited = viewModel::onLogoutUrlVisited,
                             onSnapshotCaptured = viewModel::saveCachedPageSnapshot,
-                            onOfflineCacheModeChanged = viewModel::setIspShowingOfflineCache,
-                            onSelectCachedSnapshot = viewModel::openIspCachedSnapshot,
-                            onShowCustomOfflineScreen = viewModel::showIspCustomOfflineScreen,
-                            onOpenAlerts = { viewModel.selectTab(AppTab.ALERTS) },
-                            onManualRefresh = viewModel::reloadIspWebPage,
-                            isInnerScrolledProvider = { viewModel.isIspInnerScrolled },
-                            useFullStoreHooks = false,
-                            tagPrefix = "isp",
+                            onOfflineCacheModeChanged = viewModel::setShowingOfflineCache,
+                            onSelectCachedSnapshot = viewModel::openCachedSnapshot,
+                            onShowCustomOfflineScreen = viewModel::showCustomOfflineScreen,
+                            onOpenAlerts = { viewModel.openAlertsTab() },
+                            onManualRefresh = {
+                                viewModel.reloadCurrentWebPage()
+                                viewModel.syncNow()
+                            },
+                            isInnerScrolledProvider = { viewModel.isWebInnerScrolled },
+                            useFullStoreHooks = true,
+                            tagPrefix = primaryStoreTab.id,
                             modifier = Modifier
                                 .fillMaxSize()
-                                .zIndex(if (showIspWeb) 2f else 0f)
+                                .zIndex(if (primaryVisible) 2f else 0f)
                         )
                     }
+
+                    // Dynamic secondary top workspaces (e.g., ISP or any panel-configured tabs), kept alive once opened
+                    uiState.visibleTopTabs
+                        .filter { !it.isPrimaryStore && it.id in uiState.openedWorkspaceIds }
+                        .forEach { topTab ->
+                            key(topTab.id) {
+                                val tabVisible = !showAlertsOverlay && uiState.selectedWorkspaceId == topTab.id
+                                val secState = uiState.secondaryWebStates[topTab.id]
+                                    ?: SecondaryWebState(workspaceId = topTab.id, currentUrl = topTab.url)
+
+                                PortalWebViewScreen(
+                                    initialUrl = topTab.url,
+                                    isVisible = tabVisible,
+                                    isOnline = uiState.isOnline,
+                                    pendingSyncCount = uiState.pendingSyncCount,
+                                    pageProgress = secState.pageProgress,
+                                    canGoBack = secState.canGoBack,
+                                    webError = secState.webError,
+                                    isShowingOfflineCache = secState.isShowingOfflineCache,
+                                    cachedPages = uiState.cachedPages,
+                                    offlinePageCache = viewModel.offlinePageCache,
+                                    jsBridge = viewModel.getSecondaryBridge(topTab.id),
+                                    commands = viewModel.getSecondaryCommands(topTab.id),
+                                    onProgressChanged = { p -> viewModel.updateSecondaryProgress(topTab.id, p) },
+                                    onNavigationChanged = { u, b ->
+                                        viewModel.updateSecondaryNavigationState(topTab.id, u, b)
+                                    },
+                                    onErrorChanged = { err -> viewModel.setSecondaryWebError(topTab.id, err) },
+                                    onSessionCookieCaptured = {},
+                                    onLogoutUrlVisited = {},
+                                    onSnapshotCaptured = viewModel::saveCachedPageSnapshot,
+                                    onOfflineCacheModeChanged = { cache ->
+                                        viewModel.setSecondaryShowingOfflineCache(topTab.id, cache)
+                                    },
+                                    onSelectCachedSnapshot = { snap ->
+                                        viewModel.openSecondaryCachedSnapshot(topTab.id, snap)
+                                    },
+                                    onShowCustomOfflineScreen = {
+                                        viewModel.showSecondaryCustomOfflineScreen(topTab.id)
+                                    },
+                                    onOpenAlerts = { viewModel.openAlertsTab() },
+                                    onManualRefresh = {
+                                        viewModel.reloadSecondaryWebPage(topTab.id, topTab.url)
+                                    },
+                                    isInnerScrolledProvider = { viewModel.isSecondaryInnerScrolled(topTab.id) },
+                                    useFullStoreHooks = false,
+                                    tagPrefix = topTab.id,
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .zIndex(if (tabVisible) 2f else 0f)
+                                )
+                            }
+                        }
 
                     if (showAlertsOverlay) {
                         Surface(
@@ -485,6 +594,34 @@ fun BanglaStoreApp(
                     }
                 }
             }
+        }
+
+        if (isGpsBlocked) {
+            MandatoryGpsBlockingOverlay(
+                hasPermission = uiState.hasForegroundLocationPermission,
+                isDeviceGpsOn = uiState.isDeviceGpsEnabled,
+                isAppGpsToggleOn = uiState.config.gpsTrackingEnabled,
+                onGrantPermission = {
+                    foregroundLocationOnlyLauncher.launch(
+                        arrayOf(
+                            Manifest.permission.ACCESS_FINE_LOCATION,
+                            Manifest.permission.ACCESS_COARSE_LOCATION
+                        )
+                    )
+                },
+                onOpenAppSettings = {
+                    LocationPermissionHelper.openAppDetailsSettings(context)
+                },
+                onOpenLocationSettings = {
+                    LocationPermissionHelper.openLocationSettings(context)
+                },
+                onEnableAppGpsToggle = {
+                    viewModel.toggleGpsTracking(true)
+                },
+                onRecheck = {
+                    viewModel.refreshDeviceAndPermissionState()
+                }
+            )
         }
     }
 
@@ -568,6 +705,24 @@ fun BanglaStoreApp(
             onDismiss = { showSettingsSheet = false }
         )
     }
+
+    if (showAiAssistantSheet) {
+        val aiWorkspace = if (activeWorkspace.id.equals(AppWorkspace.ISP.id, ignoreCase = true)) {
+            AppWorkspace.ISP
+        } else {
+            AppWorkspace.BANGLA_STORE
+        }
+        AiAssistantBottomSheet(
+            aiState = aiState,
+            activeWorkspace = aiWorkspace,
+            onAttachImageUri = viewModel::attachAiImage,
+            onClearImage = viewModel::clearAiImage,
+            onSendPrompt = viewModel::sendAiPrompt,
+            onClearChat = viewModel::clearAiChat,
+            onCopiedMessage = viewModel::notifyClipboardCopied,
+            onDismiss = { showAiAssistantSheet = false }
+        )
+    }
 }
 
 @Composable
@@ -617,19 +772,14 @@ private fun TopWorkspaceTabChip(
 }
 
 @Composable
-private fun TabIconWithBadge(
-    tab: AppTab,
+private fun BottomTabIconWithBadge(
+    tab: RemoteBottomTab,
     selected: Boolean,
     unreadCount: Int
 ) {
-    val icon: ImageVector = when (tab) {
-        AppTab.PORTAL -> if (selected) Icons.Rounded.Storefront else Icons.Outlined.Storefront
-        AppTab.ATTENDANCE -> if (selected) Icons.Rounded.PersonPinCircle else Icons.Outlined.PersonPinCircle
-        AppTab.TASKS -> if (selected) Icons.Rounded.TaskAlt else Icons.Outlined.TaskAlt
-        AppTab.ALERTS -> if (selected) Icons.Rounded.Notifications else Icons.Outlined.Notifications
-    }
+    val icon = resolveTabIcon(tab.icon.ifBlank { tab.id }, selected)
 
-    if (tab == AppTab.ALERTS && unreadCount > 0) {
+    if (tab.type == "alerts" && unreadCount > 0) {
         BadgedBox(
             badge = {
                 Badge(
@@ -640,9 +790,213 @@ private fun TabIconWithBadge(
                 }
             }
         ) {
-            Icon(imageVector = icon, contentDescription = tab.labelEn)
+            Icon(imageVector = icon, contentDescription = tab.label)
         }
     } else {
-        Icon(imageVector = icon, contentDescription = tab.labelEn)
+        Icon(imageVector = icon, contentDescription = tab.label)
+    }
+}
+
+private fun resolveTabIcon(iconKey: String, selected: Boolean): ImageVector {
+    return when (iconKey.trim().lowercase()) {
+        "router", "isp" -> if (selected) Icons.Rounded.Router else Icons.Outlined.Router
+        "attendance", "person_pin" ->
+            if (selected) Icons.Rounded.PersonPinCircle else Icons.Outlined.PersonPinCircle
+        "tasks", "task", "checklist" ->
+            if (selected) Icons.Rounded.TaskAlt else Icons.Outlined.TaskAlt
+        "alerts", "notifications", "notification" ->
+            if (selected) Icons.Rounded.Notifications else Icons.Outlined.Notifications
+        "dashboard", "admin" ->
+            if (selected) Icons.Rounded.Dashboard else Icons.Outlined.Dashboard
+        "billing", "receipt", "accounts", "invoice" ->
+            if (selected) Icons.Rounded.ReceiptLong else Icons.Outlined.ReceiptLong
+        "staff", "people", "group", "users" ->
+            if (selected) Icons.Rounded.Group else Icons.Outlined.Group
+        "web", "link", "globe" ->
+            if (selected) Icons.Rounded.Language else Icons.Outlined.Language
+        else -> if (selected) Icons.Rounded.Storefront else Icons.Outlined.Storefront
+    }
+}
+
+@Composable
+private fun MandatoryGpsBlockingOverlay(
+    hasPermission: Boolean,
+    isDeviceGpsOn: Boolean,
+    isAppGpsToggleOn: Boolean,
+    onGrantPermission: () -> Unit,
+    onOpenAppSettings: () -> Unit,
+    onOpenLocationSettings: () -> Unit,
+    onEnableAppGpsToggle: () -> Unit,
+    onRecheck: () -> Unit
+) {
+    val primaryReason = when {
+        !hasPermission -> "GPS লোকেশন অনুমতি দেওয়া হয়নি"
+        !isDeviceGpsOn -> "ফোনের GPS / Location বন্ধ আছে"
+        else -> "অ্যাপের GPS ট্র্যাকিং সেটিংস বন্ধ আছে"
+    }
+
+    val primaryButtonLabel = when {
+        !hasPermission -> "GPS অনুমতি দিন"
+        !isDeviceGpsOn -> "ফোনের GPS অন করুন"
+        else -> "অ্যাপ GPS চালু করুন"
+    }
+
+    val primaryAction = when {
+        !hasPermission -> onGrantPermission
+        !isDeviceGpsOn -> onOpenLocationSettings
+        else -> onEnableAppGpsToggle
+    }
+
+    Surface(
+        color = MaterialTheme.colorScheme.background.copy(alpha = 0.98f),
+        modifier = Modifier
+            .fillMaxSize()
+            .zIndex(10f)
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = {}
+            )
+            .testTag("mandatory_gps_blocking_overlay")
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .systemBarsPadding()
+                .verticalScroll(rememberScrollState())
+                .padding(24.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            ElevatedCard(
+                shape = RoundedCornerShape(24.dp),
+                modifier = Modifier.widthIn(max = 460.dp)
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(24.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(72.dp)
+                            .clip(CircleShape)
+                            .background(MaterialTheme.colorScheme.errorContainer),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.GpsOff,
+                            contentDescription = "GPS বন্ধ",
+                            tint = MaterialTheme.colorScheme.onErrorContainer,
+                            modifier = Modifier.size(36.dp)
+                        )
+                    }
+
+                    Text(
+                        text = "GPS অন করা আবশ্যক",
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        textAlign = TextAlign.Center
+                    )
+
+                    Text(
+                        text = primaryReason,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.error,
+                        textAlign = TextAlign.Center
+                    )
+
+                    Text(
+                        text = "GPS অন করা ছাড়া এই সফটওয়্যার ব্যবহার করা যাবে না। একবার GPS অনুমতি দিলে অ্যাপ বন্ধ বা ইন্টারনেট না থাকলেও ব্যাকগ্রাউন্ডে লোকেশন সংরক্ষিত থাকবে এবং ১ ঘণ্টা বা প্যানেল রিকোয়েস্টে সার্ভারে পাঠানো হবে।",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        textAlign = TextAlign.Center
+                    )
+
+                    Surface(
+                        shape = RoundedCornerShape(16.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            GpsCheckItem(
+                                label = "লোকেশন অনুমতি (Permission)",
+                                ok = hasPermission
+                            )
+                            GpsCheckItem(
+                                label = "ফোনের GPS সুইচ (Location ON)",
+                                ok = isDeviceGpsOn
+                            )
+                            GpsCheckItem(
+                                label = "অ্যাপ GPS ট্র্যাকিং",
+                                ok = isAppGpsToggleOn
+                            )
+                        }
+                    }
+
+                    Button(
+                        onClick = primaryAction,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 50.dp)
+                            .testTag("mandatory_gps_action_button")
+                    ) {
+                        Text(primaryButtonLabel)
+                    }
+
+                    if (!hasPermission) {
+                        OutlinedButton(
+                            onClick = onOpenAppSettings,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 48.dp)
+                                .testTag("mandatory_gps_app_settings_button")
+                        ) {
+                            Text("অ্যাপ সেটিংস থেকে চালু করুন")
+                        }
+                    } else if (!isDeviceGpsOn) {
+                        TextButton(
+                            onClick = onRecheck,
+                            modifier = Modifier
+                                .heightIn(min = 48.dp)
+                                .testTag("mandatory_gps_recheck_button")
+                        ) {
+                            Text("GPS অন করেছি — আবার চেক করুন")
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun GpsCheckItem(
+    label: String,
+    ok: Boolean
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Icon(
+            imageVector = if (ok) Icons.Rounded.CheckCircle else Icons.Rounded.ErrorOutline,
+            contentDescription = null,
+            tint = if (ok) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
+            modifier = Modifier.size(20.dp)
+        )
+        Text(
+            text = if (ok) "$label — চালু আছে" else "$label — বন্ধ আছে",
+            style = MaterialTheme.typography.bodySmall,
+            color = if (ok) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.error,
+            fontWeight = if (ok) FontWeight.Normal else FontWeight.SemiBold
+        )
     }
 }

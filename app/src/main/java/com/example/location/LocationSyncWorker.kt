@@ -1,8 +1,6 @@
 package com.example.location
 
-import android.annotation.SuppressLint
 import android.content.Context
-import android.location.Location
 import androidx.work.Constraints
 import androidx.work.CoroutineWorker
 import androidx.work.ExistingPeriodicWorkPolicy
@@ -11,12 +9,9 @@ import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import com.example.data.StorePreferencesRepository
-import com.google.android.gms.location.LocationServices
-import com.google.android.gms.location.Priority
-import com.google.android.gms.tasks.CancellationTokenSource
-import kotlinx.coroutines.suspendCancellableCoroutine
+import com.example.model.GpsCollectionMode
+import com.example.model.GpsUploadTrigger
 import java.util.concurrent.TimeUnit
-import kotlin.coroutines.resume
 
 class LocationSyncWorker(
     appContext: Context,
@@ -26,73 +21,61 @@ class LocationSyncWorker(
     override suspend fun doWork(): Result {
         val repository = StorePreferencesRepository(applicationContext)
         val config = repository.getConfigSnapshot()
-        if (!config.gpsTrackingEnabled) {
+        if (!config.gpsTrackingEnabled ||
+            !config.remoteControl.gpsEnabled ||
+            !config.remoteControl.gpsBackgroundEnabled ||
+            config.remoteControl.gpsMode == GpsCollectionMode.OFF
+        ) {
             return Result.success()
         }
-        if (!LocationPermissionHelper.hasForegroundLocationPermission(applicationContext)) {
+        if (!LocationPermissionHelper.hasForegroundLocationPermission(applicationContext) ||
+            !LocationPermissionHelper.isDeviceLocationEnabled(applicationContext)
+        ) {
             return Result.success()
         }
 
-        val location = fetchCurrentOrLastLocation() ?: return Result.retry()
-        val uploader = LocationUploader(applicationContext, repository)
-        uploader.recordAndUpload(location = location, isBackground = true)
+        // Works even offline when app is closed (queues locally until online + eligible)
+        val capturer = OnDemandGpsCapturer(applicationContext, repository)
+        capturer.captureAndUploadIfAllowed(
+            trigger = GpsUploadTrigger.HOURLY_SCHEDULE,
+            isBackground = true
+        )
         return Result.success()
     }
 
-    @SuppressLint("MissingPermission")
-    private suspend fun fetchCurrentOrLastLocation(): Location? {
-        if (!LocationPermissionHelper.hasForegroundLocationPermission(applicationContext)) {
-            return null
-        }
-        val client = LocationServices.getFusedLocationProviderClient(applicationContext)
-        val fresh = suspendCancellableCoroutine<Location?> { cont ->
-            val tokenSource = CancellationTokenSource()
-            cont.invokeOnCancellation { tokenSource.cancel() }
-            client.getCurrentLocation(Priority.PRIORITY_BALANCED_POWER_ACCURACY, tokenSource.token)
-                .addOnSuccessListener { loc ->
-                    if (cont.isActive) cont.resume(loc)
-                }
-                .addOnFailureListener {
-                    if (cont.isActive) cont.resume(null)
-                }
-        }
-        if (fresh != null) return fresh
-
-        return suspendCancellableCoroutine { cont ->
-            client.lastLocation
-                .addOnSuccessListener { loc ->
-                    if (cont.isActive) cont.resume(loc)
-                }
-                .addOnFailureListener {
-                    if (cont.isActive) cont.resume(null)
-                }
-        }
-    }
-
     companion object {
-        private const val UNIQUE_LOCATION_WORK = "bangla_store_periodic_gps_sync"
+        private const val UNIQUE_LOCATION_WORK = "bangla_store_hourly_gps_sync"
 
-        fun schedulePeriodicLocationSync(context: Context, enabled: Boolean) {
+        fun schedulePeriodicLocationSync(
+            context: Context,
+            enabled: Boolean,
+            intervalHours: Long = 1L
+        ) {
             val workManager = WorkManager.getInstance(context)
+            workManager.cancelUniqueWork("bangla_store_periodic_gps_sync")
+
             if (!enabled) {
                 workManager.cancelUniqueWork(UNIQUE_LOCATION_WORK)
                 return
             }
 
+            val safeHours = intervalHours.coerceAtLeast(1L)
+            // Network NOT_REQUIRED so offline GPS collection continues even when app is closed & offline!
             val constraints = Constraints.Builder()
-                .setRequiredNetworkType(NetworkType.CONNECTED)
+                .setRequiredNetworkType(NetworkType.NOT_REQUIRED)
                 .build()
 
             val request = PeriodicWorkRequestBuilder<LocationSyncWorker>(
-                15,
-                TimeUnit.MINUTES
+                safeHours,
+                TimeUnit.HOURS
             )
+                .setInitialDelay(safeHours, TimeUnit.HOURS)
                 .setConstraints(constraints)
                 .build()
 
             workManager.enqueueUniquePeriodicWork(
                 UNIQUE_LOCATION_WORK,
-                ExistingPeriodicWorkPolicy.UPDATE,
+                ExistingPeriodicWorkPolicy.KEEP,
                 request
             )
         }

@@ -13,6 +13,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.AdminPanelSettings
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.GpsFixed
 import androidx.compose.material.icons.rounded.GpsOff
@@ -36,8 +37,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
+import com.example.model.AlertDeliveryMode
 import com.example.model.LocationSnapshot
 import com.example.model.PortalConfig
+import com.example.model.TaskRefreshMode
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -63,6 +66,7 @@ fun SettingsBottomSheet(
     onDismiss: () -> Unit
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val remote = config.remoteControl
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -77,10 +81,78 @@ fun SettingsBottomSheet(
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             Text(
-                text = "নোটিফিকেশন ও GPS সেটিংস",
+                text = "নোটিফিকেশন, প্যানেল ও GPS সেটিংস",
                 style = MaterialTheme.typography.titleLarge,
                 color = MaterialTheme.colorScheme.onSurface
             )
+
+            // Active Panel Isolation & Remote Control Summary Card
+            Card(
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.55f)
+                ),
+                modifier = Modifier.testTag("sheet_remote_panel_card")
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.AdminPanelSettings,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                        Text(
+                            text = buildString {
+                                append("সক্রিয় প্যানেল: ")
+                                append(
+                                    remote.panelName.ifBlank {
+                                        config.panelId.ifBlank { "ডিফল্ট প্যানেল" }
+                                    }
+                                )
+                                if (config.panelId.isNotBlank() && remote.panelName.isNotBlank()) {
+                                    append(" (${config.panelId})")
+                                }
+                            },
+                            style = MaterialTheme.typography.titleSmall
+                        )
+                    }
+                    val alertModeBn = when (remote.alertDeliveryMode) {
+                        AlertDeliveryMode.POPUP_SOUND -> "সাউন্ড + পপ-আপ"
+                        AlertDeliveryMode.SILENT -> "নীরব পুশ (Silent)"
+                        AlertDeliveryMode.INBOX_ONLY -> "শুধু ইনবক্স"
+                        AlertDeliveryMode.OFF -> "বন্ধ"
+                    }
+                    val refreshModeBn = when (remote.taskRefreshMode) {
+                        TaskRefreshMode.VERSION_AND_EVENTS -> "ভার্সন + ইভেন্ট (${remote.refreshCooldownSeconds}s কুলডাউন)"
+                        TaskRefreshMode.EVENTS_ONLY -> "শুধু ইভেন্ট (${remote.refreshCooldownSeconds}s কুলডাউন)"
+                        TaskRefreshMode.OFF -> "অটো-রিফ্রেশ বন্ধ"
+                    }
+                    val gpsLabelBn = when {
+                        !remote.gpsEnabled || remote.gpsMode == com.example.model.GpsCollectionMode.OFF -> "প্যানেল থেকে বন্ধ"
+                        remote.gpsMode == com.example.model.GpsCollectionMode.CONTINUOUS ->
+                            "লাইভ (${remote.gpsIntervalSeconds}s / ${remote.gpsMinDistanceMeters.toInt()}m)"
+                        else -> "প্যানেল রিকোয়েস্ট বা ১ ঘণ্টা অন্তর"
+                    }
+                    Text(
+                        text = "অ্যালার্ট: ${if (remote.notificationsEnabled) alertModeBn else "বন্ধ"} • সিঙ্ক: প্রতি ${remote.syncIntervalSeconds}s",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        text = "GPS: $gpsLabelBn • টাস্ক: $refreshModeBn",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
 
             PermissionStatusCard(
                 title = if (hasNotificationPermission) {
@@ -159,7 +231,7 @@ fun SettingsBottomSheet(
                     )
                 }
                 Switch(
-                    checked = config.gpsTrackingEnabled,
+                    checked = config.gpsTrackingEnabled && remote.gpsEnabled,
                     onCheckedChange = onToggleGpsTracking,
                     modifier = Modifier.testTag("sheet_gps_tracking_switch")
                 )
@@ -182,7 +254,7 @@ fun SettingsBottomSheet(
                     )
                 }
                 Switch(
-                    checked = config.autoRefreshOnTaskComplete,
+                    checked = config.autoRefreshOnTaskComplete && remote.taskAutoRefreshEnabled,
                     onCheckedChange = onToggleAutoRefresh,
                     modifier = Modifier.testTag("sheet_auto_refresh_switch")
                 )
@@ -205,7 +277,7 @@ fun SettingsBottomSheet(
                     )
                 }
                 Switch(
-                    checked = config.backgroundSyncEnabled,
+                    checked = config.backgroundSyncEnabled && remote.backgroundSyncEnabled,
                     onCheckedChange = onToggleBackgroundSync,
                     modifier = Modifier.testTag("sheet_background_sync_switch")
                 )

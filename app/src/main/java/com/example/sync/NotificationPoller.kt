@@ -4,9 +4,13 @@ import android.content.Context
 import android.net.Uri
 import android.webkit.CookieManager
 import com.example.data.StorePreferencesRepository
+import com.example.location.OnDemandGpsCapturer
+import com.example.model.AlertDeliveryMode
+import com.example.model.GpsUploadTrigger
 import com.example.model.NotificationEventType
 import com.example.model.PortalConfig
 import com.example.model.StoreNotification
+import com.example.model.TaskRefreshMode
 import com.example.notifications.NotificationHelper
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -20,6 +24,7 @@ data class PollSyncResult(
     val success: Boolean,
     val newNotificationsCount: Int,
     val shouldAutoRefreshTasks: Boolean,
+    val gpsRequestFulfilled: Boolean = false,
     val statusMessage: String
 )
 
@@ -68,7 +73,7 @@ class NotificationPoller(
                 }
 
                 val bodyString = response.body?.string().orEmpty().trim()
-                if (bodyString.isEmpty() || !bodyString.startsWith("{") && !bodyString.startsWith("[")) {
+                if (bodyString.isEmpty() || (!bodyString.startsWith("{") && !bodyString.startsWith("["))) {
                     val msg = "অবৈধ JSON রেসপন্স — PHP API ফরম্যাট যাচাই করুন"
                     repository.updateLastSync(now, msg)
                     return@withContext PollSyncResult(
@@ -85,10 +90,63 @@ class NotificationPoller(
                     JSONObject(bodyString)
                 }
 
+                // Strict multi-panel root guard
+                val rootPanelId = rootObj.optString("panel_id", "").trim()
+                if (config.panelId.isNotBlank() &&
+                    rootPanelId.isNotBlank() &&
+                    !rootPanelId.equals(config.panelId, ignoreCase = true)
+                ) {
+                    val msg = "প্যানেল আইডি অমিল — অন্য প্যানেলের ডেটা ব্লক করা হয়েছে"
+                    repository.updateLastSync(now, msg)
+                    return@withContext PollSyncResult(
+                        success = false,
+                        newNotificationsCount = 0,
+                        shouldAutoRefreshTasks = false,
+                        statusMessage = msg
+                    )
+                }
+
+                if (config.panelId.isBlank() && rootPanelId.isNotBlank()) {
+                    repository.updateSessionFromWeb(
+                        role = null,
+                        userId = null,
+                        userName = null,
+                        panelId = rootPanelId
+                    )
+                }
+
+                // If server bundles inline app_config inside notifications.php, apply it immediately
+                val bundledConfig = if (rootObj.has("app_config") || rootObj.has("config")) {
+                    RemoteConfigSyncer.parseRemoteControlSettings(rootObj)
+                } else {
+                    null
+                }
+                if (bundledConfig != null) {
+                    repository.saveRemoteControl(
+                        bundledConfig,
+                        RemoteConfigSyncer.extractUrlOverrides(rootObj)
+                    )
+                }
+                val latestConfig = if (bundledConfig != null) {
+                    repository.getConfigSnapshot()
+                } else {
+                    config
+                }
+                val remoteControl = latestConfig.remoteControl
+
+                var gpsFulfilled = RemoteConfigSyncer.handleRemoteGpsRequestObject(
+                    sourceObj = rootObj,
+                    config = latestConfig,
+                    context = context,
+                    repository = repository
+                )
+
                 val incomingVersion = rootObj.optString("task_version", "")
                 var shouldRefresh = false
                 if (incomingVersion.isNotBlank() && incomingVersion != lastVersion) {
-                    if (lastVersion.isNotBlank()) {
+                    if (lastVersion.isNotBlank() &&
+                        remoteControl.taskRefreshMode == TaskRefreshMode.VERSION_AND_EVENTS
+                    ) {
                         shouldRefresh = true
                     }
                     repository.setLastTaskVersion(incomingVersion)
@@ -97,36 +155,68 @@ class NotificationPoller(
                 val itemsArray = rootObj.optJSONArray("notifications") ?: JSONArray()
                 var newCount = 0
 
+                val canDeliverAlerts = remoteControl.notificationsEnabled &&
+                    remoteControl.alertDeliveryMode != AlertDeliveryMode.OFF
+
                 for (i in 0 until itemsArray.length()) {
                     val obj = itemsArray.optJSONObject(i) ?: continue
-                    val notif = parseNotification(obj, config) ?: continue
-                    if (!matchesRoleAndUser(notif, config)) continue
+                    val notif = parseNotification(obj, latestConfig) ?: continue
+                    if (!matchesPanelRoleAndUser(notif, latestConfig)) continue
+
+                    if (notif.type == NotificationEventType.GPS_REQUEST) {
+                        val snap = OnDemandGpsCapturer(context, repository).captureAndUploadIfAllowed(
+                            trigger = GpsUploadTrigger.PANEL_REQUEST,
+                            requestId = notif.id,
+                            isBackground = true
+                        )
+                        if (snap != null) {
+                            gpsFulfilled = true
+                        }
+                        continue
+                    }
+
+                    if (remoteControl.allowedEventTypes.isNotEmpty() &&
+                        notif.type.key.lowercase() !in remoteControl.allowedEventTypes
+                    ) {
+                        continue
+                    }
 
                     val isNew = repository.recordIncomingNotification(notif, deduplicate = true)
                     if (isNew) {
                         newCount++
-                        if (notif.type == NotificationEventType.TASK_COMPLETED ||
-                            notif.type == NotificationEventType.TASK_ASSIGNED
+                        if (remoteControl.taskRefreshMode != TaskRefreshMode.OFF &&
+                            (notif.type == NotificationEventType.TASK_COMPLETED ||
+                                notif.type == NotificationEventType.TASK_ASSIGNED)
                         ) {
                             shouldRefresh = true
                         }
-                        if (showSystemNotifications) {
-                            NotificationHelper.showNotification(context, notif)
+                        if (showSystemNotifications && canDeliverAlerts) {
+                            NotificationHelper.showNotification(
+                                context,
+                                notif,
+                                remoteControl.alertDeliveryMode
+                            )
                         }
                     }
                 }
 
-                val statusMsg = if (newCount > 0) {
-                    "$newCount টি নতুন নোটিফিকেশন পাওয়া গেছে"
-                } else {
-                    "সার্ভারের সাথে সিঙ্ক সম্পন্ন (Synced)"
+                val effectiveAutoRefresh = shouldRefresh &&
+                    latestConfig.autoRefreshOnTaskComplete &&
+                    remoteControl.taskAutoRefreshEnabled &&
+                    remoteControl.taskRefreshMode != TaskRefreshMode.OFF
+
+                val statusMsg = when {
+                    gpsFulfilled -> "প্যানেল রিকোয়েস্টে GPS পাঠানো হয়েছে"
+                    newCount > 0 -> "$newCount টি নতুন নোটিফিকেশন পাওয়া গেছে"
+                    else -> "সার্ভারের সাথে সিঙ্ক সম্পন্ন (Synced)"
                 }
                 repository.updateLastSync(now, statusMsg)
 
                 PollSyncResult(
                     success = true,
                     newNotificationsCount = newCount,
-                    shouldAutoRefreshTasks = shouldRefresh && config.autoRefreshOnTaskComplete,
+                    shouldAutoRefreshTasks = effectiveAutoRefresh,
+                    gpsRequestFulfilled = gpsFulfilled,
                     statusMessage = statusMsg
                 )
             }
@@ -148,6 +238,9 @@ class NotificationPoller(
             .buildUpon()
             .appendQueryParameter("role", config.userRole.key)
             .apply {
+                if (config.panelId.isNotBlank()) {
+                    appendQueryParameter("panel_id", config.panelId)
+                }
                 if (config.userId.isNotBlank()) {
                     appendQueryParameter("user_id", config.userId)
                 }
@@ -163,13 +256,18 @@ class NotificationPoller(
         val id = obj.optString("id").ifBlank {
             "${obj.optString("type")}_${obj.optLong("timestamp", System.currentTimeMillis())}_${obj.optString("title").hashCode()}"
         }
-        val title = obj.optString("title").ifBlank { return null }
-        val message = obj.optString("message").ifBlank { title }
         val type = NotificationEventType.fromKey(obj.optString("type"))
+        val rawTitle = obj.optString("title").trim()
+        val title = if (rawTitle.isBlank()) {
+            if (type == NotificationEventType.GPS_REQUEST) "GPS লোকেশন অনুরোধ" else return null
+        } else {
+            rawTitle
+        }
+        val message = obj.optString("message").ifBlank { title }
         val defaultTarget = when (type) {
             NotificationEventType.ATTENDANCE_SUBMITTED -> config.attendanceUrl
             NotificationEventType.TASK_ASSIGNED, NotificationEventType.TASK_COMPLETED -> config.tasksUrl
-            NotificationEventType.GENERAL -> config.baseUrl
+            NotificationEventType.GPS_REQUEST, NotificationEventType.GENERAL -> config.baseUrl
         }
         val targetUrl = obj.optString("target_url").ifBlank { defaultTarget }
         val rawTimestamp = obj.optLong("timestamp", System.currentTimeMillis())
@@ -181,6 +279,7 @@ class NotificationPoller(
             title = title,
             message = message,
             actorName = obj.optString("actor_name"),
+            panelId = obj.optString("panel_id").trim(),
             targetRole = obj.optString("target_role", "all").lowercase(),
             targetUserId = obj.optString("target_user_id"),
             targetUrl = targetUrl,
@@ -189,7 +288,15 @@ class NotificationPoller(
         )
     }
 
-    private fun matchesRoleAndUser(notif: StoreNotification, config: PortalConfig): Boolean {
+    private fun matchesPanelRoleAndUser(notif: StoreNotification, config: PortalConfig): Boolean {
+        // Strict panel isolation: reject any notification belonging to a different panel
+        if (config.panelId.isNotBlank() &&
+            notif.panelId.isNotBlank() &&
+            !notif.panelId.equals(config.panelId, ignoreCase = true)
+        ) {
+            return false
+        }
+
         val roleMatch = notif.targetRole.isBlank() ||
             notif.targetRole == "all" ||
             notif.targetRole.equals(config.userRole.key, ignoreCase = true)

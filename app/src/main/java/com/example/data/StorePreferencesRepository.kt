@@ -11,17 +11,26 @@ import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.example.model.AlertDeliveryMode
 import com.example.model.AppTab
 import com.example.model.DEFAULT_ATTENDANCE_URL
 import com.example.model.DEFAULT_BASE_URL
+import com.example.model.DEFAULT_CONFIG_API_URL
 import com.example.model.DEFAULT_LOCATION_API_URL
 import com.example.model.DEFAULT_NOTIFICATION_API_URL
 import com.example.model.DEFAULT_TASKS_URL
+import com.example.model.GpsCollectionMode
 import com.example.model.LocationSnapshot
 import com.example.model.NotificationEventType
 import com.example.model.PortalConfig
+import com.example.model.RemoteBottomTab
+import com.example.model.RemoteControlSettings
+import com.example.model.RemoteTopTab
 import com.example.model.StoreNotification
+import com.example.model.TaskRefreshMode
 import com.example.model.UserRole
+import com.example.model.defaultBottomTabs
+import com.example.model.defaultTopTabs
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
@@ -40,6 +49,8 @@ class StorePreferencesRepository(private val context: Context) {
         val TASKS_URL = stringPreferencesKey("tasks_url")
         val NOTIFICATION_API_URL = stringPreferencesKey("notification_api_url")
         val LOCATION_API_URL = stringPreferencesKey("location_api_url")
+        val CONFIG_API_URL = stringPreferencesKey("config_api_url")
+        val PANEL_ID = stringPreferencesKey("panel_id")
         val USER_ROLE = stringPreferencesKey("user_role")
         val USER_ID = stringPreferencesKey("user_id")
         val USER_NAME = stringPreferencesKey("user_name")
@@ -48,6 +59,7 @@ class StorePreferencesRepository(private val context: Context) {
         val AUTO_REFRESH_ON_COMPLETE = booleanPreferencesKey("auto_refresh_on_complete")
         val BACKGROUND_SYNC_ENABLED = booleanPreferencesKey("background_sync_enabled")
         val GPS_TRACKING_ENABLED = booleanPreferencesKey("gps_tracking_enabled")
+        val REMOTE_CONTROL_JSON = stringPreferencesKey("remote_control_json")
         val NOTIFICATIONS_JSON = stringPreferencesKey("notifications_json")
         val SEEN_EVENT_IDS = stringSetPreferencesKey("seen_event_ids")
         val LAST_TASK_VERSION = stringPreferencesKey("last_task_version")
@@ -58,14 +70,22 @@ class StorePreferencesRepository(private val context: Context) {
         val LAST_ACCURACY = floatPreferencesKey("last_accuracy")
         val LAST_LOCATION_TIME = longPreferencesKey("last_location_time")
         val LAST_LOCATION_STATUS = stringPreferencesKey("last_location_status")
+        val LAST_GPS_UPLOAD_TIME = longPreferencesKey("last_gps_upload_time")
+        val LAST_GPS_SERVER_UPLOAD_TIME = longPreferencesKey("last_gps_server_upload_time")
+        val GPS_SCHEDULE_ANCHOR_TIME = longPreferencesKey("gps_schedule_anchor_time")
+        val LAST_FULFILLED_GPS_REQUEST_ID = stringPreferencesKey("last_fulfilled_gps_request_id")
         val PENDING_LOCATIONS_JSON = stringPreferencesKey("pending_locations_json")
         val PREVIOUS_TAB = stringPreferencesKey("previous_tab")
+        val PREVIOUS_TAB_ID = stringPreferencesKey("previous_tab_id")
         val PREVIOUS_URL = stringPreferencesKey("previous_url")
     }
 
     val configFlow: Flow<PortalConfig> = context.banglaStoreDataStore.data.map { prefs ->
         val storedAtt = prefs[Keys.ATTENDANCE_URL]
         val storedTasks = prefs[Keys.TASKS_URL]
+        val legacyTab = AppTab.fromRoute(prefs[Keys.PREVIOUS_TAB])
+        val storedTabId = prefs[Keys.PREVIOUS_TAB_ID]?.takeIf { it.isNotBlank() } ?: legacyTab.route
+
         PortalConfig(
             baseUrl = prefs[Keys.BASE_URL]?.ifBlank { DEFAULT_BASE_URL } ?: DEFAULT_BASE_URL,
             attendanceUrl = if (storedAtt.isNullOrBlank() || storedAtt == DEFAULT_BASE_URL) {
@@ -82,20 +102,31 @@ class StorePreferencesRepository(private val context: Context) {
                 ?: DEFAULT_NOTIFICATION_API_URL,
             locationApiUrl = prefs[Keys.LOCATION_API_URL]?.ifBlank { DEFAULT_LOCATION_API_URL }
                 ?: DEFAULT_LOCATION_API_URL,
+            configApiUrl = prefs[Keys.CONFIG_API_URL]?.ifBlank { DEFAULT_CONFIG_API_URL }
+                ?: DEFAULT_CONFIG_API_URL,
+            panelId = prefs[Keys.PANEL_ID].orEmpty(),
             userRole = UserRole.fromKey(prefs[Keys.USER_ROLE]),
             userId = prefs[Keys.USER_ID].orEmpty(),
             userName = prefs[Keys.USER_NAME].orEmpty(),
             isLoggedIn = prefs[Keys.IS_LOGGED_IN] ?: false,
-            previousTab = AppTab.fromRoute(prefs[Keys.PREVIOUS_TAB]),
+            previousTab = legacyTab,
+            previousTabId = storedTabId,
             previousUrl = prefs[Keys.PREVIOUS_URL].orEmpty(),
             autoRefreshOnTaskComplete = prefs[Keys.AUTO_REFRESH_ON_COMPLETE] ?: true,
             backgroundSyncEnabled = prefs[Keys.BACKGROUND_SYNC_ENABLED] ?: true,
-            gpsTrackingEnabled = prefs[Keys.GPS_TRACKING_ENABLED] ?: true
+            gpsTrackingEnabled = prefs[Keys.GPS_TRACKING_ENABLED] ?: true,
+            remoteControl = parseRemoteControlJson(prefs[Keys.REMOTE_CONTROL_JSON])
         )
     }
 
     val notificationsFlow: Flow<List<StoreNotification>> = context.banglaStoreDataStore.data.map { prefs ->
+        val currentPanel = prefs[Keys.PANEL_ID].orEmpty().trim()
         parseNotificationsJson(prefs[Keys.NOTIFICATIONS_JSON])
+            .filter { notif ->
+                currentPanel.isBlank() ||
+                    notif.panelId.isBlank() ||
+                    notif.panelId.equals(currentPanel, ignoreCase = true)
+            }
             .sortedByDescending { it.timestampMillis }
     }
 
@@ -111,7 +142,7 @@ class StorePreferencesRepository(private val context: Context) {
             longitude = prefs[Keys.LAST_LNG] ?: 0.0,
             accuracyMeters = prefs[Keys.LAST_ACCURACY] ?: 0f,
             timestampMillis = prefs[Keys.LAST_LOCATION_TIME] ?: 0L,
-            syncStatus = prefs[Keys.LAST_LOCATION_STATUS] ?: "GPS অপেক্ষমাণ (Waiting)"
+            syncStatus = prefs[Keys.LAST_LOCATION_STATUS] ?: "প্যানেল রিকোয়েস্ট বা ১ ঘণ্টা অন্তর প্রস্তুত"
         )
     }
 
@@ -137,6 +168,11 @@ class StorePreferencesRepository(private val context: Context) {
                 config.locationApiUrl,
                 DEFAULT_LOCATION_API_URL
             )
+            prefs[Keys.CONFIG_API_URL] = sanitizeHttpsUrl(
+                config.configApiUrl,
+                DEFAULT_CONFIG_API_URL
+            )
+            prefs[Keys.PANEL_ID] = config.panelId.trim()
             prefs[Keys.USER_ROLE] = config.userRole.key
             prefs[Keys.USER_ID] = config.userId.trim()
             prefs[Keys.USER_NAME] = config.userName.trim()
@@ -146,11 +182,65 @@ class StorePreferencesRepository(private val context: Context) {
         }
     }
 
-    suspend fun updateSessionFromWeb(role: UserRole?, userId: String?, userName: String?) {
+    suspend fun saveRemoteControl(
+        settings: RemoteControlSettings,
+        urlOverrides: Map<String, String> = emptyMap()
+    ) {
         context.banglaStoreDataStore.edit { prefs ->
+            prefs[Keys.REMOTE_CONTROL_JSON] = serializeRemoteControlJson(settings)
+            urlOverrides["base_url"]?.let { prefs[Keys.BASE_URL] = sanitizeHttpsUrl(it, DEFAULT_BASE_URL) }
+            urlOverrides["attendance_url"]?.let {
+                prefs[Keys.ATTENDANCE_URL] = sanitizeHttpsUrl(it, DEFAULT_ATTENDANCE_URL)
+            }
+            urlOverrides["tasks_url"]?.let { prefs[Keys.TASKS_URL] = sanitizeHttpsUrl(it, DEFAULT_TASKS_URL) }
+            urlOverrides["notification_api_url"]?.let {
+                prefs[Keys.NOTIFICATION_API_URL] = sanitizeHttpsUrl(it, DEFAULT_NOTIFICATION_API_URL)
+            }
+            urlOverrides["location_api_url"]?.let {
+                prefs[Keys.LOCATION_API_URL] = sanitizeHttpsUrl(it, DEFAULT_LOCATION_API_URL)
+            }
+            urlOverrides["config_api_url"]?.let {
+                prefs[Keys.CONFIG_API_URL] = sanitizeHttpsUrl(it, DEFAULT_CONFIG_API_URL)
+            }
+        }
+    }
+
+    suspend fun updateSessionFromWeb(
+        role: UserRole?,
+        userId: String?,
+        userName: String?,
+        panelId: String? = null
+    ) {
+        context.banglaStoreDataStore.edit { prefs ->
+            val cleanNewPanel = panelId?.trim().orEmpty()
+            val oldPanel = prefs[Keys.PANEL_ID].orEmpty().trim()
+            val cleanNewUser = userId?.trim().orEmpty()
+            val oldUser = prefs[Keys.USER_ID].orEmpty().trim()
+
+            val panelChanged = cleanNewPanel.isNotBlank() &&
+                oldPanel.isNotBlank() &&
+                !cleanNewPanel.equals(oldPanel, ignoreCase = true)
+            val userChanged = cleanNewUser.isNotBlank() &&
+                oldUser.isNotBlank() &&
+                !cleanNewUser.equals(oldUser, ignoreCase = true)
+
+            // Strict isolation: wipe cached inbox, version, and previous panel config when switching panels/users
+            if (panelChanged || userChanged) {
+                prefs[Keys.NOTIFICATIONS_JSON] = "[]"
+                prefs[Keys.SEEN_EVENT_IDS] = emptySet()
+                prefs[Keys.LAST_TASK_VERSION] = ""
+                prefs[Keys.REMOTE_CONTROL_JSON] = ""
+                prefs[Keys.PREVIOUS_URL] = ""
+                prefs[Keys.LAST_FULFILLED_GPS_REQUEST_ID] = ""
+                prefs[Keys.LAST_GPS_UPLOAD_TIME] = 0L
+            }
+
+            if (cleanNewPanel.isNotBlank()) {
+                prefs[Keys.PANEL_ID] = cleanNewPanel
+            }
             if (role != null) prefs[Keys.USER_ROLE] = role.key
-            if (!userId.isNullOrBlank()) {
-                prefs[Keys.USER_ID] = userId.trim()
+            if (cleanNewUser.isNotBlank()) {
+                prefs[Keys.USER_ID] = cleanNewUser
                 prefs[Keys.IS_LOGGED_IN] = true
             }
             if (!userName.isNullOrBlank()) prefs[Keys.USER_NAME] = userName.trim()
@@ -171,7 +261,17 @@ class StorePreferencesRepository(private val context: Context) {
     suspend fun markLoggedInUserId(userId: String) {
         if (userId.isBlank()) return
         context.banglaStoreDataStore.edit { prefs ->
-            prefs[Keys.USER_ID] = userId.trim()
+            val cleanUser = userId.trim()
+            val oldUser = prefs[Keys.USER_ID].orEmpty().trim()
+            if (oldUser.isNotBlank() && !cleanUser.equals(oldUser, ignoreCase = true)) {
+                prefs[Keys.NOTIFICATIONS_JSON] = "[]"
+                prefs[Keys.SEEN_EVENT_IDS] = emptySet()
+                prefs[Keys.LAST_TASK_VERSION] = ""
+                prefs[Keys.REMOTE_CONTROL_JSON] = ""
+                prefs[Keys.LAST_FULFILLED_GPS_REQUEST_ID] = ""
+                prefs[Keys.LAST_GPS_UPLOAD_TIME] = 0L
+            }
+            prefs[Keys.USER_ID] = cleanUser
             prefs[Keys.IS_LOGGED_IN] = true
         }
     }
@@ -181,16 +281,28 @@ class StorePreferencesRepository(private val context: Context) {
             prefs[Keys.IS_LOGGED_IN] = false
             prefs[Keys.USER_ID] = ""
             prefs[Keys.USER_NAME] = ""
+            prefs[Keys.PANEL_ID] = ""
             prefs[Keys.SESSION_COOKIE] = ""
+            prefs[Keys.NOTIFICATIONS_JSON] = "[]"
+            prefs[Keys.SEEN_EVENT_IDS] = emptySet()
+            prefs[Keys.LAST_TASK_VERSION] = ""
+            prefs[Keys.REMOTE_CONTROL_JSON] = ""
+            prefs[Keys.LAST_FULFILLED_GPS_REQUEST_ID] = ""
+            prefs[Keys.LAST_GPS_UPLOAD_TIME] = 0L
         }
     }
 
     suspend fun savePreviousWebLocation(tab: AppTab, url: String) {
-        if (!tab.isWebTab) return
+        savePreviousTabLocation(tabId = tab.route, legacyTab = tab, url = url)
+    }
+
+    suspend fun savePreviousTabLocation(tabId: String, legacyTab: AppTab, url: String) {
+        if (tabId == AppTab.ALERTS.route) return
         val cleanUrl = url.trim()
         if (cleanUrl.isNotBlank() && !cleanUrl.startsWith("http", ignoreCase = true)) return
         context.banglaStoreDataStore.edit { prefs ->
-            prefs[Keys.PREVIOUS_TAB] = tab.route
+            prefs[Keys.PREVIOUS_TAB] = legacyTab.route
+            prefs[Keys.PREVIOUS_TAB_ID] = tabId.ifBlank { legacyTab.route }
             if (cleanUrl.isNotBlank()) {
                 prefs[Keys.PREVIOUS_URL] = cleanUrl
             }
@@ -257,13 +369,28 @@ class StorePreferencesRepository(private val context: Context) {
     ): Boolean {
         var isNew = false
         context.banglaStoreDataStore.edit { prefs ->
+            val currentPanel = prefs[Keys.PANEL_ID].orEmpty().trim()
+            if (currentPanel.isNotBlank() &&
+                notification.panelId.isNotBlank() &&
+                !notification.panelId.equals(currentPanel, ignoreCase = true)
+            ) {
+                isNew = false
+                return@edit
+            }
+
+            val scopedNotification = if (notification.panelId.isBlank() && currentPanel.isNotBlank()) {
+                notification.copy(panelId = currentPanel)
+            } else {
+                notification
+            }
+
             val seenIds = prefs[Keys.SEEN_EVENT_IDS]?.toMutableSet() ?: mutableSetOf()
-            if (deduplicate && seenIds.contains(notification.id)) {
+            if (deduplicate && seenIds.contains(scopedNotification.id)) {
                 isNew = false
                 return@edit
             }
             isNew = true
-            seenIds.add(notification.id)
+            seenIds.add(scopedNotification.id)
             val trimmedSeen = if (seenIds.size > 200) {
                 seenIds.toList().takeLast(150).toSet()
             } else {
@@ -272,8 +399,8 @@ class StorePreferencesRepository(private val context: Context) {
             prefs[Keys.SEEN_EVENT_IDS] = trimmedSeen
 
             val current = parseNotificationsJson(prefs[Keys.NOTIFICATIONS_JSON]).toMutableList()
-            current.removeAll { it.id == notification.id }
-            current.add(0, notification)
+            current.removeAll { it.id == scopedNotification.id }
+            current.add(0, scopedNotification)
             val capped = current.take(60)
             prefs[Keys.NOTIFICATIONS_JSON] = serializeNotificationsJson(capped)
         }
@@ -321,6 +448,64 @@ class StorePreferencesRepository(private val context: Context) {
         }
     }
 
+    suspend fun getLastGpsUploadTime(): Long {
+        return context.banglaStoreDataStore.data.first()[Keys.LAST_GPS_UPLOAD_TIME] ?: 0L
+    }
+
+    suspend fun markGpsUploadTime(timestampMillis: Long) {
+        context.banglaStoreDataStore.edit { prefs ->
+            prefs[Keys.LAST_GPS_UPLOAD_TIME] = timestampMillis
+        }
+    }
+
+    suspend fun getLastGpsServerUploadTime(): Long {
+        return context.banglaStoreDataStore.data.first()[Keys.LAST_GPS_SERVER_UPLOAD_TIME] ?: 0L
+    }
+
+    suspend fun markGpsServerUploadTime(timestampMillis: Long) {
+        context.banglaStoreDataStore.edit { prefs ->
+            prefs[Keys.LAST_GPS_SERVER_UPLOAD_TIME] = timestampMillis
+            prefs[Keys.LAST_GPS_UPLOAD_TIME] = timestampMillis
+        }
+    }
+
+    suspend fun ensureAndGetGpsScheduleAnchorTime(): Long {
+        var result = 0L
+        context.banglaStoreDataStore.edit { prefs ->
+            val existing = prefs[Keys.GPS_SCHEDULE_ANCHOR_TIME] ?: 0L
+            if (existing > 0L) {
+                result = existing
+            } else {
+                val now = System.currentTimeMillis()
+                prefs[Keys.GPS_SCHEDULE_ANCHOR_TIME] = now
+                result = now
+            }
+        }
+        return result
+    }
+
+    suspend fun getGpsReferenceUploadOrAnchorTime(): Long {
+        val prefs = context.banglaStoreDataStore.data.first()
+        val serverTime = prefs[Keys.LAST_GPS_SERVER_UPLOAD_TIME] ?: 0L
+        if (serverTime > 0L) return serverTime
+        return prefs[Keys.GPS_SCHEDULE_ANCHOR_TIME] ?: 0L
+    }
+
+    suspend fun isGpsRequestFulfilled(requestId: String): Boolean {
+        val clean = requestId.trim()
+        if (clean.isEmpty()) return false
+        return context.banglaStoreDataStore.data.first()[Keys.LAST_FULFILLED_GPS_REQUEST_ID]
+            .orEmpty() == clean
+    }
+
+    suspend fun markGpsRequestFulfilled(requestId: String) {
+        val clean = requestId.trim()
+        if (clean.isEmpty()) return
+        context.banglaStoreDataStore.edit { prefs ->
+            prefs[Keys.LAST_FULFILLED_GPS_REQUEST_ID] = clean
+        }
+    }
+
     private fun sanitizeHttpsUrl(raw: String, fallback: String): String {
         val trimmed = raw.trim()
         if (trimmed.isEmpty()) return fallback
@@ -346,6 +531,7 @@ class StorePreferencesRepository(private val context: Context) {
                             title = obj.optString("title"),
                             message = obj.optString("message"),
                             actorName = obj.optString("actor_name"),
+                            panelId = obj.optString("panel_id"),
                             targetRole = obj.optString("target_role", "all"),
                             targetUserId = obj.optString("target_user_id"),
                             targetUrl = obj.optString("target_url", DEFAULT_BASE_URL),
@@ -367,6 +553,7 @@ class StorePreferencesRepository(private val context: Context) {
                 put("title", item.title)
                 put("message", item.message)
                 put("actor_name", item.actorName)
+                put("panel_id", item.panelId)
                 put("target_role", item.targetRole)
                 put("target_user_id", item.targetUserId)
                 put("target_url", item.targetUrl)
@@ -376,5 +563,151 @@ class StorePreferencesRepository(private val context: Context) {
             array.put(obj)
         }
         return array.toString()
+    }
+
+    private fun parseRemoteControlJson(raw: String?): RemoteControlSettings {
+        if (raw.isNullOrBlank()) return RemoteControlSettings()
+        return runCatching {
+            val obj = JSONObject(raw)
+            val topArr = obj.optJSONArray("top_tabs")
+            val topTabs = if (topArr != null && topArr.length() > 0) {
+                buildList {
+                    for (i in 0 until topArr.length()) {
+                        val t = topArr.optJSONObject(i) ?: continue
+                        val id = t.optString("id").trim()
+                        val label = t.optString("label").trim()
+                        val url = t.optString("url").trim()
+                        if (id.isNotBlank() && label.isNotBlank() && url.isNotBlank()) {
+                            add(
+                                RemoteTopTab(
+                                    id = id,
+                                    label = label,
+                                    url = url,
+                                    icon = t.optString("icon", "storefront"),
+                                    roles = jsonArrayToList(t.optJSONArray("roles")).ifEmpty { listOf("all") },
+                                    enabled = t.optBoolean("enabled", true),
+                                    isPrimaryStore = t.optBoolean("is_primary_store", false)
+                                )
+                            )
+                        }
+                    }
+                }.ifEmpty { defaultTopTabs() }
+            } else {
+                defaultTopTabs()
+            }
+
+            val bottomArr = obj.optJSONArray("bottom_tabs")
+            val bottomTabs = if (bottomArr != null && bottomArr.length() > 0) {
+                buildList {
+                    for (i in 0 until bottomArr.length()) {
+                        val b = bottomArr.optJSONObject(i) ?: continue
+                        val id = b.optString("id").trim()
+                        val label = b.optString("label").trim()
+                        if (id.isNotBlank() && label.isNotBlank()) {
+                            add(
+                                RemoteBottomTab(
+                                    id = id,
+                                    label = label,
+                                    url = b.optString("url"),
+                                    icon = b.optString("icon", id),
+                                    type = b.optString("type", if (id == "alerts") "alerts" else "web"),
+                                    roles = jsonArrayToList(b.optJSONArray("roles")).ifEmpty { listOf("all") },
+                                    enabled = b.optBoolean("enabled", true)
+                                )
+                            )
+                        }
+                    }
+                }.ifEmpty { defaultBottomTabs() }
+            } else {
+                defaultBottomTabs()
+            }
+
+            RemoteControlSettings(
+                configVersion = obj.optString("config_version", ""),
+                panelName = obj.optString("panel_name", ""),
+                topTabs = topTabs,
+                bottomTabs = bottomTabs,
+                notificationsEnabled = obj.optBoolean("notifications_enabled", true),
+                alertDeliveryMode = AlertDeliveryMode.fromKey(obj.optString("alert_delivery_mode", "popup_sound")),
+                syncIntervalSeconds = obj.optInt("sync_interval_seconds", 30).coerceIn(10, 3600),
+                backgroundSyncEnabled = obj.optBoolean("background_sync_enabled", true),
+                allowedEventTypes = jsonArrayToList(obj.optJSONArray("allowed_event_types")),
+                gpsEnabled = obj.optBoolean("gps_enabled", true),
+                gpsMode = GpsCollectionMode.fromKey(obj.optString("gps_mode", "on_demand_or_hourly")),
+                gpsIntervalSeconds = obj.optInt("gps_interval_seconds", 3600).coerceIn(10, 86400),
+                gpsMinDistanceMeters = obj.optDouble("gps_min_distance_meters", 10.0)
+                    .toFloat()
+                    .coerceIn(0f, 5000f),
+                gpsBackgroundEnabled = obj.optBoolean("gps_background_enabled", true),
+                taskAutoRefreshEnabled = obj.optBoolean("task_auto_refresh_enabled", true),
+                taskRefreshMode = TaskRefreshMode.fromKey(obj.optString("task_refresh_mode", "version_and_events")),
+                refreshCooldownSeconds = obj.optInt("refresh_cooldown_seconds", 20).coerceIn(5, 3600),
+                refreshOnlyOnTabs = jsonArrayToList(obj.optJSONArray("refresh_only_on_tabs"))
+            )
+        }.getOrDefault(RemoteControlSettings())
+    }
+
+    private fun serializeRemoteControlJson(settings: RemoteControlSettings): String {
+        val obj = JSONObject().apply {
+            put("config_version", settings.configVersion)
+            put("panel_name", settings.panelName)
+            put("notifications_enabled", settings.notificationsEnabled)
+            put("alert_delivery_mode", settings.alertDeliveryMode.key)
+            put("sync_interval_seconds", settings.syncIntervalSeconds)
+            put("background_sync_enabled", settings.backgroundSyncEnabled)
+            put("allowed_event_types", JSONArray(settings.allowedEventTypes))
+            put("gps_enabled", settings.gpsEnabled)
+            put("gps_mode", settings.gpsMode.key)
+            put("gps_interval_seconds", settings.gpsIntervalSeconds)
+            put("gps_min_distance_meters", settings.gpsMinDistanceMeters.toDouble())
+            put("gps_background_enabled", settings.gpsBackgroundEnabled)
+            put("task_auto_refresh_enabled", settings.taskAutoRefreshEnabled)
+            put("task_refresh_mode", settings.taskRefreshMode.key)
+            put("refresh_cooldown_seconds", settings.refreshCooldownSeconds)
+            put("refresh_only_on_tabs", JSONArray(settings.refreshOnlyOnTabs))
+
+            val topArr = JSONArray()
+            settings.topTabs.forEach { tab ->
+                topArr.put(
+                    JSONObject().apply {
+                        put("id", tab.id)
+                        put("label", tab.label)
+                        put("url", tab.url)
+                        put("icon", tab.icon)
+                        put("roles", JSONArray(tab.roles))
+                        put("enabled", tab.enabled)
+                        put("is_primary_store", tab.isPrimaryStore)
+                    }
+                )
+            }
+            put("top_tabs", topArr)
+
+            val bottomArr = JSONArray()
+            settings.bottomTabs.forEach { tab ->
+                bottomArr.put(
+                    JSONObject().apply {
+                        put("id", tab.id)
+                        put("label", tab.label)
+                        put("url", tab.url)
+                        put("icon", tab.icon)
+                        put("type", tab.type)
+                        put("roles", JSONArray(tab.roles))
+                        put("enabled", tab.enabled)
+                    }
+                )
+            }
+            put("bottom_tabs", bottomArr)
+        }
+        return obj.toString()
+    }
+
+    private fun jsonArrayToList(array: JSONArray?): List<String> {
+        if (array == null || array.length() == 0) return emptyList()
+        return buildList {
+            for (i in 0 until array.length()) {
+                val v = array.optString(i).trim().lowercase()
+                if (v.isNotBlank()) add(v)
+            }
+        }
     }
 }

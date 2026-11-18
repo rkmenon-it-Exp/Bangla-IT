@@ -14,4 +14,10 @@
     <string name="cd_notifications">Open notifications</string>
     <string name="cd_settings">Open notification settings</string>
     <string name="cd_banner_illustration">Store attendance and task notification illustration</string>
+    <string name="ai_assistant_title">AI সহায়ক (Gemini)</string>
+    <string name="cd_ai_assistant">Open AI Assistant</string>
+    <string name="cd_ai_clear_chat">Clear AI chat</string>
+    <string name="cd_ai_close">Close AI Assistant</string>
+    <string name="cd_ai_attach_image">Attach photo for AI analysis</string>
+    <string name="cd_ai_send">Send message to Gemini</string>
 </resources>

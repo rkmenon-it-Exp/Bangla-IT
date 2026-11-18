@@ -1,8 +1,6 @@
 package com.example.sync
 
-import android.annotation.SuppressLint
 import android.content.Context
-import android.location.Location
 import androidx.work.BackoffPolicy
 import androidx.work.Constraints
 import androidx.work.CoroutineWorker
@@ -14,12 +12,10 @@ import androidx.work.WorkerParameters
 import com.example.data.StorePreferencesRepository
 import com.example.location.LocationPermissionHelper
 import com.example.location.LocationUploader
-import com.google.android.gms.location.LocationServices
-import com.google.android.gms.location.Priority
-import com.google.android.gms.tasks.CancellationTokenSource
-import kotlinx.coroutines.suspendCancellableCoroutine
+import com.example.location.OnDemandGpsCapturer
+import com.example.model.GpsCollectionMode
+import com.example.model.GpsUploadTrigger
 import java.util.concurrent.TimeUnit
-import kotlin.coroutines.resume
 
 class ImmediateSyncWorker(
     appContext: Context,
@@ -28,50 +24,43 @@ class ImmediateSyncWorker(
 
     override suspend fun doWork(): Result {
         val repository = StorePreferencesRepository(applicationContext)
+        // 1. Fetch panel config & fulfill any explicit panel GPS request right away
+        RemoteConfigSyncer(applicationContext, repository).syncConfig()
         val config = repository.getConfigSnapshot()
         val uploader = LocationUploader(applicationContext, repository)
 
-        // 1. Immediately flush any queued offline GPS locations
-        uploader.flushPendingLocations()
+        // 2. Calculate elapsed time since previous server upload (or permission anchor):
+        //    If >= 1 hour has passed while offline / app closed, flush & send GPS immediately upon reconnect!
+        val refTime = repository.getGpsReferenceUploadOrAnchorTime()
+        val intervalMs = config.remoteControl.gpsIntervalSeconds.coerceAtLeast(3600) * 1000L
+        val hourlyDue = refTime > 0L && (System.currentTimeMillis() - refTime) >= (intervalMs - 90_000L)
 
-        // 2. Capture & send a fresh GPS fix if tracking is enabled
-        if (config.gpsTrackingEnabled &&
-            LocationPermissionHelper.hasForegroundLocationPermission(applicationContext)
+        // Flush panel_request items always, and all offline-collected GPS items if >= 1 hour elapsed
+        val flushed = uploader.flushPendingLocations(forceAll = hourlyDue)
+
+        if (hourlyDue &&
+            flushed == 0 &&
+            config.gpsTrackingEnabled &&
+            config.remoteControl.gpsEnabled &&
+            config.remoteControl.gpsBackgroundEnabled &&
+            config.remoteControl.gpsMode != GpsCollectionMode.OFF &&
+            LocationPermissionHelper.hasForegroundLocationPermission(applicationContext) &&
+            LocationPermissionHelper.isDeviceLocationEnabled(applicationContext)
         ) {
-            fetchCurrentOrLastLocation()?.let { loc ->
-                uploader.recordAndUpload(location = loc, isBackground = true)
-            }
+            OnDemandGpsCapturer(applicationContext, repository, uploader)
+                .captureAndUploadIfAllowed(
+                    trigger = GpsUploadTrigger.HOURLY_SCHEDULE,
+                    isBackground = true
+                )
         }
 
-        // 3. Immediately poll server notifications so missed admin/staff alerts arrive right away
-        if (config.backgroundSyncEnabled) {
+        // 3. Immediately poll server notifications (also catches gps_request notifications)
+        if (config.backgroundSyncEnabled && config.remoteControl.backgroundSyncEnabled) {
             val poller = NotificationPoller(applicationContext, repository)
             poller.pollOnce(showSystemNotifications = true)
         }
 
         return Result.success()
-    }
-
-    @SuppressLint("MissingPermission")
-    private suspend fun fetchCurrentOrLastLocation(): Location? {
-        if (!LocationPermissionHelper.hasForegroundLocationPermission(applicationContext)) {
-            return null
-        }
-        val client = LocationServices.getFusedLocationProviderClient(applicationContext)
-        val fresh = suspendCancellableCoroutine<Location?> { cont ->
-            val tokenSource = CancellationTokenSource()
-            cont.invokeOnCancellation { tokenSource.cancel() }
-            client.getCurrentLocation(Priority.PRIORITY_BALANCED_POWER_ACCURACY, tokenSource.token)
-                .addOnSuccessListener { loc -> if (cont.isActive) cont.resume(loc) }
-                .addOnFailureListener { if (cont.isActive) cont.resume(null) }
-        }
-        if (fresh != null) return fresh
-
-        return suspendCancellableCoroutine { cont ->
-            client.lastLocation
-                .addOnSuccessListener { loc -> if (cont.isActive) cont.resume(loc) }
-                .addOnFailureListener { if (cont.isActive) cont.resume(null) }
-        }
     }
 
     companion object {

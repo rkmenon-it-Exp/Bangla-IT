@@ -7,6 +7,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
+import com.example.ai.configureAppCheck
 import com.example.ui.BanglaStoreApp
 import com.example.ui.BanglaStoreViewModel
 import com.example.ui.theme.BanglaStoreTheme
@@ -17,6 +18,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        configureAppCheck(this, intent)
         enableEdgeToEdge()
         viewModel.handleLaunchIntent(intent)
         setContent {
@@ -30,6 +32,11 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         viewModel.handleLaunchIntent(intent)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        viewModel.refreshDeviceAndPermissionState()
     }
 
     override fun onStop() {

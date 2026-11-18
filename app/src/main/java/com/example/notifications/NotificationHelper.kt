@@ -15,6 +15,7 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import com.example.MainActivity
 import com.example.R
+import com.example.model.AlertDeliveryMode
 import com.example.model.NotificationEventType
 import com.example.model.StoreNotification
 import java.util.Locale
@@ -24,6 +25,7 @@ object NotificationHelper {
     const val CHANNEL_ATTENDANCE = "channel_admin_attendance"
     const val CHANNEL_TASKS = "channel_staff_tasks"
     const val CHANNEL_UPDATES = "channel_task_updates"
+    const val CHANNEL_SILENT_UPDATES = "channel_silent_updates"
     const val CHANNEL_GPS_TRACKING = "channel_gps_tracking"
     const val CHANNEL_APP_UPDATES = "channel_app_updates"
 
@@ -70,6 +72,14 @@ object NotificationHelper {
             setShowBadge(false)
         }
 
+        val silentChannel = NotificationChannel(
+            CHANNEL_SILENT_UPDATES,
+            "Silent Updates (নীরব বিজ্ঞপ্তি)",
+            NotificationManager.IMPORTANCE_LOW
+        ).apply {
+            description = "Silent panel notifications without sound or pop-up."
+        }
+
         val appUpdateChannel = NotificationChannel(
             CHANNEL_APP_UPDATES,
             "App Software Updates (অ্যাপ আপডেট)",
@@ -80,7 +90,7 @@ object NotificationHelper {
         }
 
         manager.createNotificationChannels(
-            listOf(attendanceChannel, taskChannel, updateChannel, gpsChannel, appUpdateChannel)
+            listOf(attendanceChannel, taskChannel, updateChannel, silentChannel, gpsChannel, appUpdateChannel)
         )
     }
 
@@ -134,14 +144,55 @@ object NotificationHelper {
             .build()
     }
 
-    fun showNotification(context: Context, notification: StoreNotification) {
+    fun buildLocationDisabledWarningNotification(context: Context): Notification {
+        ensureChannels(context)
+        val openAppIntent = Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            context,
+            9002,
+            openAppIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        return NotificationCompat.Builder(context, CHANNEL_UPDATES)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setColor(0xFFC62828.toInt())
+            .setContentTitle("⚠️ GPS বন্ধ আছে — অন করুন")
+            .setContentText("GPS অন করা ছাড়া বাংলা স্টোর ব্যবহার করা যাবে না। এখনই লোকেশন অন করুন।")
+            .setStyle(
+                NotificationCompat.BigTextStyle()
+                    .bigText("আপনার ফোনের GPS বন্ধ আছে। GPS অন করা ছাড়া বাংলা স্টোর সফটওয়্যার ব্যবহার করা যাবে না। অনুগ্রহ করে এখনই GPS অন করুন।")
+            )
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setContentIntent(pendingIntent)
+            .build()
+    }
+
+    fun showNotification(
+        context: Context,
+        notification: StoreNotification,
+        deliveryMode: AlertDeliveryMode = AlertDeliveryMode.POPUP_SOUND
+    ) {
+        if (deliveryMode == AlertDeliveryMode.OFF || deliveryMode == AlertDeliveryMode.INBOX_ONLY) {
+            return
+        }
         ensureChannels(context)
         if (!hasNotificationPermission(context)) return
 
-        val channelId = when (notification.type) {
-            NotificationEventType.ATTENDANCE_SUBMITTED -> CHANNEL_ATTENDANCE
-            NotificationEventType.TASK_ASSIGNED -> CHANNEL_TASKS
-            NotificationEventType.TASK_COMPLETED, NotificationEventType.GENERAL -> CHANNEL_UPDATES
+        val channelId = if (deliveryMode == AlertDeliveryMode.SILENT) {
+            CHANNEL_SILENT_UPDATES
+        } else {
+            when (notification.type) {
+                NotificationEventType.ATTENDANCE_SUBMITTED -> CHANNEL_ATTENDANCE
+                NotificationEventType.TASK_ASSIGNED -> CHANNEL_TASKS
+                NotificationEventType.TASK_COMPLETED,
+                NotificationEventType.GPS_REQUEST,
+                NotificationEventType.GENERAL -> CHANNEL_UPDATES
+            }
         }
 
         val tapIntent = Intent(context, MainActivity::class.java).apply {
@@ -166,11 +217,12 @@ object NotificationHelper {
             .setStyle(NotificationCompat.BigTextStyle().bigText(notification.message))
             .setContentIntent(pendingIntent)
             .setAutoCancel(true)
+            .setSilent(deliveryMode == AlertDeliveryMode.SILENT)
             .setPriority(
-                if (notification.type == NotificationEventType.TASK_COMPLETED) {
-                    NotificationCompat.PRIORITY_DEFAULT
-                } else {
-                    NotificationCompat.PRIORITY_HIGH
+                when {
+                    deliveryMode == AlertDeliveryMode.SILENT -> NotificationCompat.PRIORITY_LOW
+                    notification.type == NotificationEventType.TASK_COMPLETED -> NotificationCompat.PRIORITY_DEFAULT
+                    else -> NotificationCompat.PRIORITY_HIGH
                 }
             )
 

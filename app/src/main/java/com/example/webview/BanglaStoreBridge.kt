@@ -8,12 +8,13 @@ import com.example.model.UserRole
 import org.json.JSONObject
 
 class BanglaStoreBridge(
-    private val onSessionDetectedCallback: (UserRole?, String?, String?) -> Unit,
+    private val onSessionDetectedCallback: (UserRole?, String?, String?, String?) -> Unit,
     private val onLoginSubmittedCallback: (String) -> Unit,
     private val onLogoutDetectedCallback: () -> Unit,
     private val onPageReadyCallback: (String, Boolean) -> Unit,
     private val onIncomingEventCallback: (StoreNotification, Boolean) -> Unit,
     private val onRefreshRequestedCallback: (String?) -> Unit,
+    private val onGpsRequestedCallback: (String) -> Unit = {},
     private val onInnerScrollChangedCallback: (Boolean) -> Unit,
     private val locationSnapshotProvider: () -> LocationSnapshot
 ) {
@@ -21,7 +22,13 @@ class BanglaStoreBridge(
     @JavascriptInterface
     fun onSessionDetected(role: String?, userId: String?, userName: String?) {
         val parsedRole = if (role.isNullOrBlank()) null else UserRole.fromKey(role)
-        onSessionDetectedCallback(parsedRole, userId, userName)
+        onSessionDetectedCallback(parsedRole, userId, userName, null)
+    }
+
+    @JavascriptInterface
+    fun onSessionWithPanel(role: String?, userId: String?, userName: String?, panelId: String?) {
+        val parsedRole = if (role.isNullOrBlank()) null else UserRole.fromKey(role)
+        onSessionDetectedCallback(parsedRole, userId, userName, panelId)
     }
 
     @JavascriptInterface
@@ -132,6 +139,12 @@ class BanglaStoreBridge(
         onRefreshRequestedCallback(targetUrl)
     }
 
+    @JavascriptInterface
+    fun onGpsRequested(requestId: String?) {
+        val cleanId = requestId?.trim().orEmpty().ifBlank { "js_${System.currentTimeMillis()}" }
+        onGpsRequestedCallback(cleanId)
+    }
+
     companion object {
         const val BRIDGE_NAME = "BanglaStoreBridge"
 
@@ -181,11 +194,15 @@ class BanglaStoreBridge(
                     var roleMeta = document.querySelector('meta[name="banglastore-role"]');
                     var userMeta = document.querySelector('meta[name="banglastore-user-id"]');
                     var nameMeta = document.querySelector('meta[name="banglastore-user-name"]');
-                    if (roleMeta || userMeta || nameMeta) {
-                        window.BanglaStoreBridge.onSessionDetected(
+                    var panelMeta = document.querySelector('meta[name="banglastore-panel-id"]');
+                    var panelEl = !panelMeta ? document.querySelector('[data-panel-id]') : null;
+                    var panelId = panelMeta ? (panelMeta.content || '') : (panelEl ? (panelEl.getAttribute('data-panel-id') || '') : '');
+                    if (roleMeta || userMeta || nameMeta || panelId) {
+                        window.BanglaStoreBridge.onSessionWithPanel(
                             roleMeta ? roleMeta.content : '',
                             userMeta ? userMeta.content : '',
-                            nameMeta ? nameMeta.content : ''
+                            nameMeta ? nameMeta.content : '',
+                            panelId
                         );
                     }
                     window.BanglaStoreBridge.onPageReady(window.location.href || '', detectLoginPage());
@@ -195,7 +212,6 @@ class BanglaStoreBridge(
                 window.__banglaStoreHooked = true;
 
                 try {
-                    // Detect whether touch starts inside an already-scrolled inner container
                     document.addEventListener('touchstart', function(ev) {
                         try {
                             var scrolled = (window.scrollY || document.documentElement.scrollTop || 0) > 0;
@@ -210,7 +226,6 @@ class BanglaStoreBridge(
                         } catch (e) {}
                     }, { passive: true });
 
-                    // Capture staff user_id when submitting a login form
                     document.addEventListener('submit', function(ev) {
                         try {
                             var form = ev.target;
@@ -219,7 +234,6 @@ class BanglaStoreBridge(
                         } catch (e) {}
                     }, true);
 
-                    // Also detect JS/AJAX login button clicks inside a login form
                     document.addEventListener('click', function(ev) {
                         try {
                             var target = ev.target && ev.target.closest ? ev.target.closest('a, button, input[type="submit"], input[type="button"]') : null;
@@ -240,7 +254,14 @@ class BanglaStoreBridge(
                         var d = e.data;
                         if (!d || d.source !== 'bangla_store') return;
                         var p = d.payload || {};
-                        if (d.event === 'attendance_submitted') {
+                        if (d.event === 'session_updated') {
+                            window.BanglaStoreBridge.onSessionWithPanel(
+                                p.role || '',
+                                p.userId || p.user_id || '',
+                                p.userName || p.user_name || '',
+                                p.panelId || p.panel_id || ''
+                            );
+                        } else if (d.event === 'attendance_submitted') {
                             window.BanglaStoreBridge.onAttendanceSubmitted(p.staffName || '', p.timeText || '', p.targetUrl || '');
                         } else if (d.event === 'task_assigned') {
                             window.BanglaStoreBridge.onTaskAssigned(p.assigneeUserId || '', p.taskTitle || '', p.assignedBy || '', p.targetUrl || '');
@@ -248,6 +269,8 @@ class BanglaStoreBridge(
                             window.BanglaStoreBridge.onTaskCompleted(p.taskId || '', p.taskTitle || '', p.completedBy || '');
                         } else if (d.event === 'refresh') {
                             window.BanglaStoreBridge.requestRefresh(p.targetUrl || '');
+                        } else if (d.event === 'gps_request') {
+                            window.BanglaStoreBridge.onGpsRequested(p.requestId || p.request_id || '');
                         }
                     });
                 } catch (err) {}

@@ -1,30 +1,52 @@
 package com.example.ui
 
 import android.app.Application
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import android.location.LocationManager
+import android.net.Uri
 import android.os.Build
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.ai.AiAssistantUiState
+import com.example.ai.AiChatMessage
+import com.example.ai.AiGenerationUiState
+import com.example.ai.GeminiAssistantService
 import com.example.data.StorePreferencesRepository
 import com.example.location.LocationPermissionHelper
 import com.example.location.LocationSyncWorker
 import com.example.location.LocationUploader
+import com.example.location.OnDemandGpsCapturer
+import com.example.model.AlertDeliveryMode
 import com.example.model.AlertFilter
 import com.example.model.AppTab
 import com.example.model.AppWorkspace
-import com.example.model.DEFAULT_ISP_URL
+import com.example.model.GpsCollectionMode
+import com.example.model.GpsUploadTrigger
 import com.example.model.LocationSnapshot
 import com.example.model.NotificationEventType
 import com.example.model.PortalConfig
+import com.example.model.RemoteBottomTab
+import com.example.model.RemoteTopTab
 import com.example.model.StoreNotification
+import com.example.model.TaskRefreshMode
+import com.example.model.defaultBottomTabs
+import com.example.model.defaultTopTabs
 import com.example.notifications.NotificationHelper
+import com.example.sync.AppUpdateChecker
 import com.example.sync.ImmediateSyncWorker
 import com.example.sync.NetworkMonitor
 import com.example.sync.NotificationPoller
 import com.example.sync.NotificationSyncWorker
+import com.example.sync.RemoteConfigSyncer
 import com.example.webview.BanglaStoreBridge
 import com.example.webview.CachedPageSnapshot
 import com.example.webview.OfflinePageCache
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -32,11 +54,14 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
+import java.util.concurrent.ConcurrentHashMap
 
 sealed interface WebViewCommand {
     data class LoadUrl(val url: String) : WebViewCommand
@@ -45,18 +70,21 @@ sealed interface WebViewCommand {
     data object GoBack : WebViewCommand
 }
 
-data class IspWebState(
-    val hasOpened: Boolean = false,
+data class SecondaryWebState(
+    val workspaceId: String,
     val pageProgress: Int = 100,
-    val currentUrl: String = DEFAULT_ISP_URL,
+    val currentUrl: String = "",
     val canGoBack: Boolean = false,
     val webError: String? = null,
     val isShowingOfflineCache: Boolean = false
 )
 
 data class BanglaStoreUiState(
-    val selectedWorkspace: AppWorkspace = AppWorkspace.BANGLA_STORE,
-    val selectedTab: AppTab = AppTab.PORTAL,
+    val selectedWorkspaceId: String = AppWorkspace.BANGLA_STORE.id,
+    val openedWorkspaceIds: Set<String> = setOf(AppWorkspace.BANGLA_STORE.id),
+    val visibleTopTabs: List<RemoteTopTab> = defaultTopTabs(),
+    val visibleBottomTabs: List<RemoteBottomTab> = defaultBottomTabs(),
+    val selectedBottomTabId: String = AppTab.PORTAL.route,
     val config: PortalConfig = PortalConfig(),
     val notifications: List<StoreNotification> = emptyList(),
     val filteredNotifications: List<StoreNotification> = emptyList(),
@@ -66,7 +94,7 @@ data class BanglaStoreUiState(
     val currentUrl: String = "",
     val canGoBack: Boolean = false,
     val webError: String? = null,
-    val ispState: IspWebState = IspWebState(),
+    val secondaryWebStates: Map<String, SecondaryWebState> = emptyMap(),
     val isOnline: Boolean = true,
     val pendingSyncCount: Int = 0,
     val isShowingOfflineCache: Boolean = false,
@@ -78,27 +106,49 @@ data class BanglaStoreUiState(
     val hasNotificationPermission: Boolean = true,
     val hasForegroundLocationPermission: Boolean = false,
     val hasBackgroundLocationPermission: Boolean = false,
+    val isDeviceGpsEnabled: Boolean = true,
     val showBackgroundLocationDialog: Boolean = false
-)
+) {
+    val activeWorkspaceTab: RemoteTopTab
+        get() = visibleTopTabs.firstOrNull { it.id == selectedWorkspaceId }
+            ?: visibleTopTabs.firstOrNull()
+            ?: defaultTopTabs().first()
+
+    val primaryStoreTab: RemoteTopTab
+        get() = visibleTopTabs.firstOrNull { it.isPrimaryStore }
+            ?: visibleTopTabs.firstOrNull()
+            ?: defaultTopTabs().first()
+
+    val isAlertsOverlayVisible: Boolean
+        get() = visibleBottomTabs.firstOrNull { it.id == selectedBottomTabId }?.type == "alerts" ||
+            selectedBottomTabId == AppTab.ALERTS.route
+}
 
 class BanglaStoreViewModel(application: Application) : AndroidViewModel(application) {
 
     private val repository = StorePreferencesRepository(application)
     private val poller = NotificationPoller(application, repository)
+    private val remoteConfigSyncer = RemoteConfigSyncer(application, repository)
     private val locationUploader = LocationUploader(application, repository)
+    private val gpsCapturer = OnDemandGpsCapturer(application, repository, locationUploader)
     private val networkMonitor = NetworkMonitor(application)
+    private val geminiAssistant = GeminiAssistantService()
     val offlinePageCache = OfflinePageCache(application)
 
-    private val _selectedWorkspace = MutableStateFlow(AppWorkspace.BANGLA_STORE)
-    private val _selectedTab = MutableStateFlow(AppTab.PORTAL)
-    private var lastWebTab: AppTab = AppTab.PORTAL
+    private val _aiState = MutableStateFlow(AiAssistantUiState())
+    val aiState: StateFlow<AiAssistantUiState> = _aiState.asStateFlow()
+
+    private val _selectedWorkspaceId = MutableStateFlow(AppWorkspace.BANGLA_STORE.id)
+    private val _openedWorkspaceIds = MutableStateFlow(setOf(AppWorkspace.BANGLA_STORE.id))
+    private val _selectedBottomTabId = MutableStateFlow(AppTab.PORTAL.route)
+    private var lastWebBottomTabId: String = AppTab.PORTAL.route
     private val _alertFilter = MutableStateFlow(AlertFilter.ALL)
     private val _pageProgress = MutableStateFlow(100)
     private val _currentUrl = MutableStateFlow("")
     private val _canGoBack = MutableStateFlow(false)
     private val _webError = MutableStateFlow<String?>(null)
     private val _isShowingOfflineCache = MutableStateFlow(false)
-    private val _ispState = MutableStateFlow(IspWebState())
+    private val _secondaryWebStates = MutableStateFlow<Map<String, SecondaryWebState>>(emptyMap())
     private val _cachedPages = MutableStateFlow(offlinePageCache.listCachedPages())
     private val _isSyncing = MutableStateFlow(false)
     private val _hasNotificationPermission = MutableStateFlow(
@@ -110,32 +160,72 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
     private val _hasBackgroundLocation = MutableStateFlow(
         LocationPermissionHelper.hasBackgroundLocationPermission(application)
     )
+    private val _isDeviceGpsEnabled = MutableStateFlow(
+        LocationPermissionHelper.isDeviceLocationEnabled(application)
+    )
     private val _showBackgroundLocationDialog = MutableStateFlow(false)
     private var promptedBackgroundThisSession = false
     private var wasOnline = networkMonitor.isOnline.value
     private var sawLoginPage = false
     private var pendingPostLoginRedirect = false
+    private var lastAutoRefreshMillis = 0L
 
     @Volatile
     var isWebInnerScrolled: Boolean = false
         private set
 
-    @Volatile
-    var isIspInnerScrolled: Boolean = false
-        private set
+    private val secondaryInnerScrolledMap = ConcurrentHashMap<String, Boolean>()
+    private val secondaryCommandsMap = ConcurrentHashMap<String, MutableSharedFlow<WebViewCommand>>()
+    private val secondaryBridgesMap = ConcurrentHashMap<String, BanglaStoreBridge>()
 
     private val _webViewCommands = MutableSharedFlow<WebViewCommand>(extraBufferCapacity = 16)
     val webViewCommands: SharedFlow<WebViewCommand> = _webViewCommands.asSharedFlow()
 
-    private val _ispWebViewCommands = MutableSharedFlow<WebViewCommand>(extraBufferCapacity = 16)
-    val ispWebViewCommands: SharedFlow<WebViewCommand> = _ispWebViewCommands.asSharedFlow()
-
     private val _snackbarMessages = MutableSharedFlow<String>(extraBufferCapacity = 16)
     val snackbarMessages: SharedFlow<String> = _snackbarMessages.asSharedFlow()
 
+    private data class WebAggregate(
+        val selectedWorkspaceId: String,
+        val openedWorkspaceIds: Set<String>,
+        val selectedBottomTabId: String,
+        val pageProgress: Int,
+        val currentUrl: String,
+        val canGoBack: Boolean,
+        val webError: String?,
+        val isShowingOfflineCache: Boolean,
+        val secondaryStates: Map<String, SecondaryWebState>,
+        val cachedPages: List<CachedPageSnapshot>
+    )
+
+    private val webAggregateFlow = combine(
+        _selectedWorkspaceId,
+        _openedWorkspaceIds,
+        _selectedBottomTabId,
+        _pageProgress,
+        _currentUrl,
+        _canGoBack,
+        _webError,
+        _isShowingOfflineCache,
+        _secondaryWebStates,
+        _cachedPages
+    ) { values ->
+        @Suppress("UNCHECKED_CAST")
+        WebAggregate(
+            selectedWorkspaceId = values[0] as String,
+            openedWorkspaceIds = values[1] as Set<String>,
+            selectedBottomTabId = values[2] as String,
+            pageProgress = values[3] as Int,
+            currentUrl = values[4] as String,
+            canGoBack = values[5] as Boolean,
+            webError = values[6] as String?,
+            isShowingOfflineCache = values[7] as Boolean,
+            secondaryStates = values[8] as Map<String, SecondaryWebState>,
+            cachedPages = values[9] as List<CachedPageSnapshot>
+        )
+    }
+
     val uiState: StateFlow<BanglaStoreUiState> = combine(
-        _selectedWorkspace,
-        _selectedTab,
+        webAggregateFlow,
         repository.configFlow,
         repository.notificationsFlow,
         _alertFilter,
@@ -143,43 +233,56 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         repository.locationFlow,
         repository.pendingSyncCountFlow,
         networkMonitor.isOnline,
-        _pageProgress,
-        _currentUrl,
-        _canGoBack,
-        _webError,
-        _ispState,
-        _isShowingOfflineCache,
-        _cachedPages,
         _isSyncing,
         _hasNotificationPermission,
         _hasForegroundLocation,
         _hasBackgroundLocation,
+        _isDeviceGpsEnabled,
         _showBackgroundLocationDialog
     ) { values ->
-        val workspace = values[0] as AppWorkspace
-        val tab = values[1] as AppTab
-        val config = values[2] as PortalConfig
+        val webAgg = values[0] as WebAggregate
+        val config = values[1] as PortalConfig
         @Suppress("UNCHECKED_CAST")
-        val allNotifications = values[3] as List<StoreNotification>
-        val filter = values[4] as AlertFilter
+        val allNotifications = values[2] as List<StoreNotification>
+        val filter = values[3] as AlertFilter
         @Suppress("UNCHECKED_CAST")
-        val syncPair = values[5] as Pair<Long, String>
-        val location = values[6] as LocationSnapshot
-        val pendingCount = values[7] as Int
-        val isOnline = values[8] as Boolean
-        val progress = values[9] as Int
-        val currentUrl = values[10] as String
-        val canGoBack = values[11] as Boolean
-        val webError = values[12] as String?
-        val ispState = values[13] as IspWebState
-        val showingOfflineCache = values[14] as Boolean
-        @Suppress("UNCHECKED_CAST")
-        val cachedList = values[15] as List<CachedPageSnapshot>
-        val isSyncing = values[16] as Boolean
-        val hasNotifPerm = values[17] as Boolean
-        val hasFgLoc = values[18] as Boolean
-        val hasBgLoc = values[19] as Boolean
-        val showBgDialog = values[20] as Boolean
+        val syncPair = values[4] as Pair<Long, String>
+        val location = values[5] as LocationSnapshot
+        val pendingCount = values[6] as Int
+        val isOnline = values[7] as Boolean
+        val isSyncing = values[8] as Boolean
+        val hasNotifPerm = values[9] as Boolean
+        val hasFgLoc = values[10] as Boolean
+        val hasBgLoc = values[11] as Boolean
+        val isDeviceGps = values[12] as Boolean
+        val showBgDialog = values[13] as Boolean
+
+        val roleKey = config.userRole.key.lowercase()
+        val visibleTop = config.remoteControl.topTabs
+            .filter { tab ->
+                tab.enabled && (tab.roles.isEmpty() || "all" in tab.roles || roleKey in tab.roles)
+            }
+            .ifEmpty { defaultTopTabs() }
+
+        val visibleBottom = config.remoteControl.bottomTabs
+            .filter { tab ->
+                tab.enabled && (tab.roles.isEmpty() || "all" in tab.roles || roleKey in tab.roles)
+            }
+            .ifEmpty { defaultBottomTabs() }
+
+        val primaryId = (visibleTop.firstOrNull { it.isPrimaryStore } ?: visibleTop.first()).id
+        val effectiveWorkspaceId = if (visibleTop.any { it.id == webAgg.selectedWorkspaceId }) {
+            webAgg.selectedWorkspaceId
+        } else {
+            primaryId
+        }
+        val effectiveOpened = webAgg.openedWorkspaceIds + primaryId
+
+        val effectiveBottomTabId = if (visibleBottom.any { it.id == webAgg.selectedBottomTabId }) {
+            webAgg.selectedBottomTabId
+        } else {
+            visibleBottom.first().id
+        }
 
         val filtered = when (filter) {
             AlertFilter.ALL -> allNotifications
@@ -193,22 +296,25 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         }
 
         BanglaStoreUiState(
-            selectedWorkspace = workspace,
-            selectedTab = tab,
+            selectedWorkspaceId = effectiveWorkspaceId,
+            openedWorkspaceIds = effectiveOpened,
+            visibleTopTabs = visibleTop,
+            visibleBottomTabs = visibleBottom,
+            selectedBottomTabId = effectiveBottomTabId,
             config = config,
             notifications = allNotifications,
             filteredNotifications = filtered,
             alertFilter = filter,
             unreadCount = allNotifications.count { !it.isRead },
-            pageProgress = progress,
-            currentUrl = currentUrl.ifBlank { config.baseUrl },
-            canGoBack = canGoBack,
-            webError = webError,
-            ispState = ispState,
+            pageProgress = webAgg.pageProgress,
+            currentUrl = webAgg.currentUrl.ifBlank { config.baseUrl },
+            canGoBack = webAgg.canGoBack,
+            webError = webAgg.webError,
+            secondaryWebStates = webAgg.secondaryStates,
             isOnline = isOnline,
             pendingSyncCount = pendingCount,
-            isShowingOfflineCache = showingOfflineCache,
-            cachedPages = cachedList,
+            isShowingOfflineCache = webAgg.isShowingOfflineCache,
+            cachedPages = webAgg.cachedPages,
             isSyncing = isSyncing,
             lastSyncTimeMillis = syncPair.first,
             lastSyncStatus = syncPair.second,
@@ -216,6 +322,7 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
             hasNotificationPermission = hasNotifPerm,
             hasForegroundLocationPermission = hasFgLoc,
             hasBackgroundLocationPermission = hasBgLoc,
+            isDeviceGpsEnabled = isDeviceGps,
             showBackgroundLocationDialog = showBgDialog
         )
     }.stateIn(
@@ -225,9 +332,17 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
     )
 
     val jsBridge: BanglaStoreBridge = BanglaStoreBridge(
-        onSessionDetectedCallback = { role, userId, userName ->
+        onSessionDetectedCallback = { role, userId, userName, panelId ->
             viewModelScope.launch {
-                repository.updateSessionFromWeb(role, userId, userName)
+                val prev = repository.getConfigSnapshot()
+                repository.updateSessionFromWeb(role, userId, userName, panelId)
+                val updated = repository.getConfigSnapshot()
+                if (updated.panelId != prev.panelId ||
+                    updated.userId != prev.userId ||
+                    updated.userRole != prev.userRole
+                ) {
+                    remoteConfigSyncer.syncConfig()
+                }
             }
         },
         onLoginSubmittedCallback = { userId ->
@@ -253,23 +368,42 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         onIncomingEventCallback = { rawNotif, shouldAutoRefresh ->
             viewModelScope.launch {
                 val config = repository.getConfigSnapshot()
+                val remoteControl = config.remoteControl
+                if (remoteControl.allowedEventTypes.isNotEmpty() &&
+                    rawNotif.type.key.lowercase() !in remoteControl.allowedEventTypes
+                ) {
+                    return@launch
+                }
+
                 val resolvedTargetUrl = rawNotif.targetUrl.ifBlank {
                     when (rawNotif.type) {
                         NotificationEventType.ATTENDANCE_SUBMITTED -> config.attendanceUrl
                         NotificationEventType.TASK_ASSIGNED,
                         NotificationEventType.TASK_COMPLETED -> config.tasksUrl
+                        NotificationEventType.GPS_REQUEST,
                         NotificationEventType.GENERAL -> config.baseUrl
                     }
                 }
-                val finalNotif = rawNotif.copy(targetUrl = resolvedTargetUrl)
+                val finalNotif = rawNotif.copy(
+                    panelId = rawNotif.panelId.ifBlank { config.panelId },
+                    targetUrl = resolvedTargetUrl
+                )
                 val isNew = repository.recordIncomingNotification(finalNotif, deduplicate = true)
-                if (isNew && shouldShowForCurrentRole(finalNotif, config)) {
-                    NotificationHelper.showNotification(getApplication(), finalNotif)
+                val canDeliver = remoteControl.notificationsEnabled &&
+                    remoteControl.alertDeliveryMode != AlertDeliveryMode.OFF
+                if (isNew && canDeliver && shouldShowForCurrentRole(finalNotif, config)) {
+                    NotificationHelper.showNotification(
+                        getApplication(),
+                        finalNotif,
+                        remoteControl.alertDeliveryMode
+                    )
                     _snackbarMessages.tryEmit(finalNotif.title)
                 }
-                if (shouldAutoRefresh && config.autoRefreshOnTaskComplete) {
-                    _webViewCommands.tryEmit(WebViewCommand.Reload)
-                    _snackbarMessages.tryEmit("টাস্ক আপডেট হয়েছে — পেজ অটো-রিফ্রেশ করা হচ্ছে")
+                if (shouldAutoRefresh) {
+                    tryAutoRefreshTasks(
+                        config = config,
+                        message = "টাস্ক আপডেট হয়েছে — পেজ অটো-রিফ্রেশ করা হচ্ছে"
+                    )
                 }
             }
         },
@@ -282,32 +416,63 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
                 }
             }
         },
+        onGpsRequestedCallback = { requestId ->
+            viewModelScope.launch {
+                val snap = gpsCapturer.captureAndUploadIfAllowed(
+                    trigger = GpsUploadTrigger.PANEL_REQUEST,
+                    requestId = requestId,
+                    isBackground = false
+                )
+                if (snap != null) {
+                    _snackbarMessages.tryEmit("প্যানেল রিকোয়েস্ট অনুযায়ী GPS পাঠানো হয়েছে")
+                }
+            }
+        },
         onInnerScrollChangedCallback = { scrolled ->
             isWebInnerScrolled = scrolled
         },
         locationSnapshotProvider = { uiState.value.locationSnapshot }
     )
 
-    val ispJsBridge: BanglaStoreBridge = BanglaStoreBridge(
-        onSessionDetectedCallback = { _, _, _ -> },
-        onLoginSubmittedCallback = { _ -> },
-        onLogoutDetectedCallback = {},
-        onPageReadyCallback = { _, _ -> },
-        onIncomingEventCallback = { _, _ -> },
-        onRefreshRequestedCallback = { targetUrl ->
-            viewModelScope.launch {
-                if (targetUrl.isNullOrBlank()) {
-                    _ispWebViewCommands.tryEmit(WebViewCommand.Reload)
-                } else {
-                    _ispWebViewCommands.tryEmit(WebViewCommand.LoadUrl(targetUrl))
-                }
-            }
-        },
-        onInnerScrollChangedCallback = { scrolled ->
-            isIspInnerScrolled = scrolled
-        },
-        locationSnapshotProvider = { uiState.value.locationSnapshot }
-    )
+    fun getSecondaryCommands(workspaceId: String): SharedFlow<WebViewCommand> {
+        return getOrCreateSecondaryCommandFlow(workspaceId).asSharedFlow()
+    }
+
+    private fun getOrCreateSecondaryCommandFlow(workspaceId: String): MutableSharedFlow<WebViewCommand> {
+        return secondaryCommandsMap.getOrPut(workspaceId) {
+            MutableSharedFlow(extraBufferCapacity = 16)
+        }
+    }
+
+    fun getSecondaryBridge(workspaceId: String): BanglaStoreBridge {
+        return secondaryBridgesMap.getOrPut(workspaceId) {
+            BanglaStoreBridge(
+                onSessionDetectedCallback = { _, _, _, _ -> },
+                onLoginSubmittedCallback = { _ -> },
+                onLogoutDetectedCallback = {},
+                onPageReadyCallback = { _, _ -> },
+                onIncomingEventCallback = { _, _ -> },
+                onRefreshRequestedCallback = { targetUrl ->
+                    viewModelScope.launch {
+                        val flow = getOrCreateSecondaryCommandFlow(workspaceId)
+                        if (targetUrl.isNullOrBlank()) {
+                            flow.tryEmit(WebViewCommand.Reload)
+                        } else {
+                            flow.tryEmit(WebViewCommand.LoadUrl(targetUrl))
+                        }
+                    }
+                },
+                onInnerScrollChangedCallback = { scrolled ->
+                    secondaryInnerScrolledMap[workspaceId] = scrolled
+                },
+                locationSnapshotProvider = { uiState.value.locationSnapshot }
+            )
+        }
+    }
+
+    fun isSecondaryInnerScrolled(workspaceId: String): Boolean {
+        return secondaryInnerScrolledMap[workspaceId] ?: false
+    }
 
     private suspend fun handleWebPageReady(url: String, hasLoginForm: Boolean) {
         if (_isShowingOfflineCache.value ||
@@ -331,9 +496,17 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
             pendingPostLoginRedirect = false
             sawLoginPage = false
 
+            remoteConfigSyncer.syncConfig()
+
             val config = repository.getConfigSnapshot()
-            val targetTab = if (config.previousTab.isWebTab) config.previousTab else AppTab.PORTAL
-            val tabDefaultUrl = defaultUrlForTab(targetTab, config)
+            val visibleBottom = uiState.value.visibleBottomTabs
+            val targetBottomId = config.previousTabId.takeIf { id ->
+                visibleBottom.any { it.id == id && it.type == "web" }
+            } ?: if (config.previousTab.isWebTab) config.previousTab.route else AppTab.PORTAL.route
+
+            val matchingBottomTab = visibleBottom.firstOrNull { it.id == targetBottomId }
+            val legacyTab = AppTab.fromRoute(targetBottomId)
+            val tabDefaultUrl = matchingBottomTab?.url?.ifBlank { null } ?: defaultUrlForTab(legacyTab, config)
             val savedPrevUrl = config.previousUrl.takeIf {
                 it.startsWith("https://", ignoreCase = true) &&
                     !isLoginUrl(it) &&
@@ -341,26 +514,32 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
             }
             val targetUrl = savedPrevUrl ?: tabDefaultUrl
 
-            val isPortalHomeAlreadyOpen = targetTab == AppTab.PORTAL &&
+            val isPortalHomeAlreadyOpen = targetBottomId == AppTab.PORTAL.route &&
                 urlsEffectivelyEqual(targetUrl, config.baseUrl) &&
                 url.startsWith(config.baseUrl, ignoreCase = true)
 
             if (!isPortalHomeAlreadyOpen &&
-                (targetTab != _selectedTab.value || !urlsEffectivelyEqual(url, targetUrl))
+                (targetBottomId != _selectedBottomTabId.value || !urlsEffectivelyEqual(url, targetUrl))
             ) {
-                _selectedTab.value = targetTab
-                lastWebTab = targetTab
+                _selectedWorkspaceId.value = uiState.value.primaryStoreTab.id
+                _selectedBottomTabId.value = targetBottomId
+                lastWebBottomTabId = targetBottomId
                 _webError.value = null
                 _isShowingOfflineCache.value = false
                 _webViewCommands.tryEmit(WebViewCommand.LoadUrl(targetUrl))
-                _snackbarMessages.tryEmit("লগইন সম্পন্ন — পূর্ববর্তী ট্যাবে (${targetTab.labelBn}) যাওয়া হচ্ছে")
+                val tabLabel = matchingBottomTab?.label ?: legacyTab.labelBn
+                _snackbarMessages.tryEmit("লগইন সম্পন্ন — পূর্ববর্তী ট্যাবে ($tabLabel) যাওয়া হচ্ছে")
                 return
             }
         }
 
         // Record current authenticated web tab & URL as the previous tab for future logins
-        val activeWebTab = if (_selectedTab.value.isWebTab) _selectedTab.value else lastWebTab
-        repository.savePreviousWebLocation(activeWebTab, url)
+        val activeId = if (!uiState.value.isAlertsOverlayVisible) {
+            _selectedBottomTabId.value
+        } else {
+            lastWebBottomTabId
+        }
+        repository.savePreviousTabLocation(activeId, AppTab.fromRoute(activeId), url)
     }
 
     private fun defaultUrlForTab(tab: AppTab, config: PortalConfig): String {
@@ -388,29 +567,75 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         return a.trim().trimEnd('/').equals(b.trim().trimEnd('/'), ignoreCase = true)
     }
 
+    private val providerChangedReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            refreshDeviceAndPermissionState()
+        }
+    }
+
     init {
         NotificationHelper.ensureChannels(application)
+        runCatching {
+            application.registerReceiver(
+                providerChangedReceiver,
+                IntentFilter(LocationManager.PROVIDERS_CHANGED_ACTION)
+            )
+        }
         viewModelScope.launch {
+            if (LocationPermissionHelper.hasForegroundLocationPermission(application)) {
+                repository.ensureAndGetGpsScheduleAnchorTime()
+            }
+            remoteConfigSyncer.syncConfig()
             val config = repository.getConfigSnapshot()
             NotificationSyncWorker.schedulePeriodicSync(
                 getApplication(),
-                config.backgroundSyncEnabled
+                config.backgroundSyncEnabled && config.remoteControl.backgroundSyncEnabled
             )
-            if (config.gpsTrackingEnabled &&
-                LocationPermissionHelper.hasForegroundLocationPermission(getApplication())
-            ) {
-                LocationPermissionHelper.startTrackingService(getApplication())
-                LocationSyncWorker.schedulePeriodicLocationSync(getApplication(), true)
-            }
+            syncGpsWorkersAndService(config)
             // Arm reconnect worker if there are already queued items or currently offline
             if (!networkMonitor.isOnline.value || repository.getPendingLocations().isNotEmpty()) {
                 ImmediateSyncWorker.scheduleOnReconnect(getApplication())
             }
             delay(3000)
-            com.example.sync.AppUpdateChecker.checkForUpdate(getApplication(), triggerNotification = true)
+            AppUpdateChecker.checkForUpdate(getApplication(), triggerNotification = true)
         }
         observeNetworkRecovery()
         startForegroundSyncLoop()
+    }
+
+    private fun syncGpsWorkersAndService(config: PortalConfig) {
+        val ctx = getApplication<Application>()
+        val fgGranted = LocationPermissionHelper.hasForegroundLocationPermission(ctx)
+        val gpsAllowed = config.gpsTrackingEnabled &&
+            config.remoteControl.gpsEnabled &&
+            config.remoteControl.gpsMode != GpsCollectionMode.OFF &&
+            fgGranted
+
+        if (!gpsAllowed) {
+            LocationPermissionHelper.stopTrackingService(ctx)
+            LocationSyncWorker.schedulePeriodicLocationSync(ctx, enabled = false)
+            return
+        }
+
+        viewModelScope.launch {
+            repository.ensureAndGetGpsScheduleAnchorTime()
+        }
+
+        // Keep background collector alive once permission is granted so offline GPS data continues
+        // collecting even when app is closed, and sends immediately on reconnect once >= 1h elapses.
+        if (config.remoteControl.gpsBackgroundEnabled || config.remoteControl.gpsMode == GpsCollectionMode.CONTINUOUS) {
+            LocationPermissionHelper.startTrackingService(ctx)
+        } else {
+            LocationPermissionHelper.stopTrackingService(ctx)
+        }
+
+        val intervalHours = (config.remoteControl.gpsIntervalSeconds.coerceAtLeast(3600) / 3600L)
+            .coerceAtLeast(1L)
+        LocationSyncWorker.schedulePeriodicLocationSync(
+            context = ctx,
+            enabled = config.remoteControl.gpsBackgroundEnabled,
+            intervalHours = intervalHours
+        )
     }
 
     private fun observeNetworkRecovery() {
@@ -422,23 +647,40 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
                         ImmediateSyncWorker.scheduleOnReconnect(getApplication())
                     } else if (!wasOnline) {
                         wasOnline = true
-                        val flushed = locationUploader.flushPendingLocations()
+                        remoteConfigSyncer.syncConfig()
+                        val latestCfg = repository.getConfigSnapshot()
+                        val intervalMs = latestCfg.remoteControl.gpsIntervalSeconds.coerceAtLeast(3600) * 1000L
+                        val refTime = repository.getGpsReferenceUploadOrAnchorTime()
+                        val elapsed = if (refTime > 0L) System.currentTimeMillis() - refTime else 0L
+                        val hourlyDue = refTime > 0L && elapsed >= (intervalMs - 90_000L)
+
+                        var flushed = locationUploader.flushPendingLocations(forceAll = hourlyDue)
+                        if (hourlyDue && flushed == 0) {
+                            val sent = gpsCapturer.captureAndUploadIfAllowed(
+                                trigger = GpsUploadTrigger.HOURLY_SCHEDULE,
+                                isBackground = false
+                            )
+                            if (sent != null) flushed = 1
+                        }
+
                         val hadOfflineUi = _webError.value != null || _isShowingOfflineCache.value
-                        val hadIspOfflineUi = _ispState.value.webError != null ||
-                            _ispState.value.isShowingOfflineCache
                         _webError.value = null
                         _isShowingOfflineCache.value = false
-                        _ispState.update { it.copy(webError = null, isShowingOfflineCache = false) }
                         if (hadOfflineUi) {
                             _webViewCommands.tryEmit(WebViewCommand.Reload)
                         }
-                        if (hadIspOfflineUi && _ispState.value.hasOpened) {
-                            _ispWebViewCommands.tryEmit(WebViewCommand.Reload)
+                        _secondaryWebStates.value.forEach { (wsId, state) ->
+                            if (state.webError != null || state.isShowingOfflineCache) {
+                                updateSecondaryState(wsId) {
+                                    it.copy(webError = null, isShowingOfflineCache = false)
+                                }
+                                getOrCreateSecondaryCommandFlow(wsId).tryEmit(WebViewCommand.Reload)
+                            }
                         }
                         runPollCycle(showSnackbarOnError = false)
                         _snackbarMessages.tryEmit(
                             if (flushed > 0) {
-                                "অনলাইন: $flushed টি সংরক্ষিত ডেটা সিঙ্ক হয়েছে"
+                                "অনলাইন: $flushed টি সংরক্ষিত GPS/ডেটা সিঙ্ক হয়েছে"
                             } else {
                                 "ইন্টারনেট সংযোগ ফিরে এসেছে — অটো-সিঙ্ক সম্পন্ন"
                             }
@@ -452,13 +694,33 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         viewModelScope.launch {
             while (isActive) {
                 val config = repository.getConfigSnapshot()
-                if (config.backgroundSyncEnabled && networkMonitor.isOnline.value) {
-                    locationUploader.flushPendingLocations()
+                val effectiveSync = config.backgroundSyncEnabled && config.remoteControl.backgroundSyncEnabled
+                if (effectiveSync && networkMonitor.isOnline.value) {
+                    remoteConfigSyncer.syncConfig()
+                    val latestCfg = repository.getConfigSnapshot()
+                    val intervalMs = latestCfg.remoteControl.gpsIntervalSeconds.coerceAtLeast(3600) * 1000L
+                    val refTime = repository.getGpsReferenceUploadOrAnchorTime()
+                    val hourlyDue = refTime > 0L && (System.currentTimeMillis() - refTime) >= (intervalMs - 90_000L)
+
+                    val flushed = locationUploader.flushPendingLocations(forceAll = hourlyDue)
                     runPollCycle(showSnackbarOnError = false)
+                    if (hourlyDue && flushed == 0) {
+                        gpsCapturer.captureAndUploadIfAllowed(
+                            trigger = GpsUploadTrigger.HOURLY_SCHEDULE,
+                            isBackground = false
+                        )
+                    }
                 }
-                delay(30_000L)
+                val intervalMs = config.remoteControl.syncIntervalSeconds.coerceIn(10, 3600) * 1000L
+                delay(intervalMs)
             }
         }
+    }
+
+    fun refreshDeviceAndPermissionState() {
+        val ctx = getApplication<Application>()
+        _isDeviceGpsEnabled.value = LocationPermissionHelper.isDeviceLocationEnabled(ctx)
+        onPermissionsUpdated(allowBackgroundPrompt = true)
     }
 
     fun onPermissionsUpdated(allowBackgroundPrompt: Boolean = true) {
@@ -466,24 +728,29 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         val notifGranted = NotificationHelper.hasNotificationPermission(ctx)
         val fgLocGranted = LocationPermissionHelper.hasForegroundLocationPermission(ctx)
         val bgLocGranted = LocationPermissionHelper.hasBackgroundLocationPermission(ctx)
+        val gpsHardwareOn = LocationPermissionHelper.isDeviceLocationEnabled(ctx)
 
         _hasNotificationPermission.value = notifGranted
         _hasForegroundLocation.value = fgLocGranted
         _hasBackgroundLocation.value = bgLocGranted
+        _isDeviceGpsEnabled.value = gpsHardwareOn
 
         viewModelScope.launch {
+            if (fgLocGranted) {
+                repository.ensureAndGetGpsScheduleAnchorTime()
+            }
             val config = repository.getConfigSnapshot()
-            if (fgLocGranted && config.gpsTrackingEnabled) {
-                LocationPermissionHelper.startTrackingService(ctx)
-                LocationSyncWorker.schedulePeriodicLocationSync(ctx, true)
-                if (allowBackgroundPrompt &&
-                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
-                    !bgLocGranted &&
-                    !promptedBackgroundThisSession
-                ) {
-                    promptedBackgroundThisSession = true
-                    _showBackgroundLocationDialog.value = true
-                }
+            syncGpsWorkersAndService(config)
+            if (fgLocGranted &&
+                config.gpsTrackingEnabled &&
+                config.remoteControl.gpsEnabled &&
+                allowBackgroundPrompt &&
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+                !bgLocGranted &&
+                !promptedBackgroundThisSession
+            ) {
+                promptedBackgroundThisSession = true
+                _showBackgroundLocationDialog.value = true
             }
         }
     }
@@ -534,56 +801,58 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         _webError.value = "ইন্টারনেট সংযোগ বিচ্ছিন্ন রয়েছে (Offline)"
     }
 
-    fun selectWorkspace(workspace: AppWorkspace) {
-        _selectedWorkspace.value = workspace
-        if (workspace == AppWorkspace.ISP) {
-            _ispState.update { it.copy(hasOpened = true) }
+    fun selectWorkspace(workspace: RemoteTopTab) {
+        _selectedWorkspaceId.value = workspace.id
+        _openedWorkspaceIds.update { it + workspace.id }
+        if (!workspace.isPrimaryStore && !_secondaryWebStates.value.containsKey(workspace.id)) {
+            _secondaryWebStates.update { map ->
+                map + (workspace.id to SecondaryWebState(workspaceId = workspace.id, currentUrl = workspace.url))
+            }
         }
-        if (_selectedTab.value == AppTab.ALERTS) {
-            _selectedTab.value = lastWebTab
+        if (uiState.value.isAlertsOverlayVisible) {
+            _selectedBottomTabId.value = lastWebBottomTabId
         }
+    }
+
+    fun selectPrimaryWorkspace() {
+        selectWorkspace(uiState.value.primaryStoreTab)
     }
 
     fun exitAlertsScreen() {
-        _selectedTab.value = lastWebTab
+        _selectedBottomTabId.value = lastWebBottomTabId
     }
 
-    fun selectTab(tab: AppTab) {
-        _selectedTab.value = tab
-        if (tab.isWebTab) {
-            _selectedWorkspace.value = AppWorkspace.BANGLA_STORE
+    fun openAlertsTab() {
+        val alertsTab = uiState.value.visibleBottomTabs.firstOrNull { it.type == "alerts" }
+        if (alertsTab != null) {
+            selectBottomTab(alertsTab)
+        } else {
+            _selectedBottomTabId.value = AppTab.ALERTS.route
         }
-        val config = uiState.value.config
-        if (tab.isWebTab && lastWebTab != tab) {
+    }
+
+    fun selectBottomTab(tab: RemoteBottomTab) {
+        _selectedBottomTabId.value = tab.id
+        if (tab.type == "alerts") {
+            return
+        }
+
+        val primaryTab = uiState.value.primaryStoreTab
+        _selectedWorkspaceId.value = primaryTab.id
+        _openedWorkspaceIds.update { it + primaryTab.id }
+
+        val targetUrl = tab.url.ifBlank { defaultUrlForTab(AppTab.fromRoute(tab.id), uiState.value.config) }
+        val tabChanged = lastWebBottomTabId != tab.id
+        if (tabChanged) {
             viewModelScope.launch {
-                repository.savePreviousWebLocation(tab, defaultUrlForTab(tab, config))
+                repository.savePreviousTabLocation(tab.id, AppTab.fromRoute(tab.id), targetUrl)
             }
         }
-        when (tab) {
-            AppTab.PORTAL -> {
-                if (lastWebTab != AppTab.PORTAL || _currentUrl.value.isBlank()) {
-                    _webViewCommands.tryEmit(WebViewCommand.LoadUrl(config.baseUrl))
-                }
-                lastWebTab = AppTab.PORTAL
-            }
-            AppTab.ATTENDANCE -> {
-                if (lastWebTab != AppTab.ATTENDANCE ||
-                    !_currentUrl.value.contains("staff_view=attendance", ignoreCase = true)
-                ) {
-                    _webViewCommands.tryEmit(WebViewCommand.LoadUrl(config.attendanceUrl))
-                }
-                lastWebTab = AppTab.ATTENDANCE
-            }
-            AppTab.TASKS -> {
-                if (lastWebTab != AppTab.TASKS ||
-                    !_currentUrl.value.contains("tasks.php", ignoreCase = true)
-                ) {
-                    _webViewCommands.tryEmit(WebViewCommand.LoadUrl(config.tasksUrl))
-                }
-                lastWebTab = AppTab.TASKS
-            }
-            AppTab.ALERTS -> Unit
+
+        if (tabChanged || _currentUrl.value.isBlank() || !urlsEffectivelyEqual(_currentUrl.value, targetUrl)) {
+            _webViewCommands.tryEmit(WebViewCommand.LoadUrl(targetUrl))
         }
+        lastWebBottomTabId = tab.id
     }
 
     fun setAlertFilter(filter: AlertFilter) {
@@ -591,19 +860,21 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     fun reloadActiveWorkspace() {
-        if (_selectedWorkspace.value == AppWorkspace.ISP) {
-            reloadIspWebPage()
-        } else {
+        val active = uiState.value.activeWorkspaceTab
+        if (active.isPrimaryStore) {
             reloadCurrentWebPage()
             syncNow()
+        } else {
+            reloadSecondaryWebPage(active.id, active.url)
         }
     }
 
     fun navigateActiveWebBack() {
-        if (_selectedWorkspace.value == AppWorkspace.ISP) {
-            _ispWebViewCommands.tryEmit(WebViewCommand.GoBack)
-        } else {
+        val active = uiState.value.activeWorkspaceTab
+        if (active.isPrimaryStore) {
             navigateWebBack()
+        } else {
+            getOrCreateSecondaryCommandFlow(active.id).tryEmit(WebViewCommand.GoBack)
         }
     }
 
@@ -619,14 +890,15 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         }
     }
 
-    fun reloadIspWebPage() {
+    fun reloadSecondaryWebPage(workspaceId: String, fallbackUrl: String) {
         networkMonitor.refreshNow()
-        _ispState.update { it.copy(webError = null, isShowingOfflineCache = false) }
-        val target = _ispState.value.currentUrl.ifBlank { DEFAULT_ISP_URL }
+        updateSecondaryState(workspaceId) { it.copy(webError = null, isShowingOfflineCache = false) }
+        val target = _secondaryWebStates.value[workspaceId]?.currentUrl.orEmpty().ifBlank { fallbackUrl }
+        val cmdFlow = getOrCreateSecondaryCommandFlow(workspaceId)
         if (target.startsWith("http", ignoreCase = true)) {
-            _ispWebViewCommands.tryEmit(WebViewCommand.LoadUrl(target))
+            cmdFlow.tryEmit(WebViewCommand.LoadUrl(target))
         } else {
-            _ispWebViewCommands.tryEmit(WebViewCommand.Reload)
+            cmdFlow.tryEmit(WebViewCommand.Reload)
         }
     }
 
@@ -649,12 +921,12 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         _webError.value = error
     }
 
-    fun updateIspProgress(progress: Int) {
-        _ispState.update { it.copy(pageProgress = progress) }
+    fun updateSecondaryProgress(workspaceId: String, progress: Int) {
+        updateSecondaryState(workspaceId) { it.copy(pageProgress = progress) }
     }
 
-    fun updateIspNavigationState(url: String?, canGoBack: Boolean) {
-        _ispState.update { state ->
+    fun updateSecondaryNavigationState(workspaceId: String, url: String?, canGoBack: Boolean) {
+        updateSecondaryState(workspaceId) { state ->
             state.copy(
                 currentUrl = if (!url.isNullOrBlank() && !url.startsWith("data:", ignoreCase = true)) {
                     url
@@ -666,25 +938,36 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         }
     }
 
-    fun setIspWebError(error: String?) {
-        _ispState.update { it.copy(webError = error) }
+    fun setSecondaryWebError(workspaceId: String, error: String?) {
+        updateSecondaryState(workspaceId) { it.copy(webError = error) }
     }
 
-    fun setIspShowingOfflineCache(showing: Boolean) {
-        _ispState.update { it.copy(isShowingOfflineCache = showing) }
+    fun setSecondaryShowingOfflineCache(workspaceId: String, showing: Boolean) {
+        updateSecondaryState(workspaceId) { it.copy(isShowingOfflineCache = showing) }
     }
 
-    fun openIspCachedSnapshot(snapshot: CachedPageSnapshot) {
-        _ispState.update { it.copy(webError = null, isShowingOfflineCache = true) }
-        _ispWebViewCommands.tryEmit(WebViewCommand.LoadHtmlSnapshot(snapshot.url, snapshot.html))
+    fun openSecondaryCachedSnapshot(workspaceId: String, snapshot: CachedPageSnapshot) {
+        updateSecondaryState(workspaceId) { it.copy(webError = null, isShowingOfflineCache = true) }
+        getOrCreateSecondaryCommandFlow(workspaceId)
+            .tryEmit(WebViewCommand.LoadHtmlSnapshot(snapshot.url, snapshot.html))
     }
 
-    fun showIspCustomOfflineScreen() {
-        _ispState.update {
+    fun showSecondaryCustomOfflineScreen(workspaceId: String) {
+        updateSecondaryState(workspaceId) {
             it.copy(
                 isShowingOfflineCache = false,
                 webError = "ইন্টারনেট সংযোগ বিচ্ছিন্ন রয়েছে (Offline)"
             )
+        }
+    }
+
+    private fun updateSecondaryState(
+        workspaceId: String,
+        transform: (SecondaryWebState) -> SecondaryWebState
+    ) {
+        _secondaryWebStates.update { currentMap ->
+            val prev = currentMap[workspaceId] ?: SecondaryWebState(workspaceId = workspaceId)
+            currentMap + (workspaceId to transform(prev))
         }
     }
 
@@ -702,7 +985,10 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         viewModelScope.launch {
             val current = repository.getConfigSnapshot()
             repository.saveConfig(current.copy(backgroundSyncEnabled = enabled))
-            NotificationSyncWorker.schedulePeriodicSync(getApplication(), enabled)
+            NotificationSyncWorker.schedulePeriodicSync(
+                getApplication(),
+                enabled && current.remoteControl.backgroundSyncEnabled
+            )
             _snackbarMessages.tryEmit(
                 if (enabled) "ব্যাকগ্রাউন্ড নোটিফিকেশন সিঙ্ক চালু হয়েছে" else "ব্যাকগ্রাউন্ড সিঙ্ক বন্ধ করা হয়েছে"
             )
@@ -711,21 +997,20 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
 
     fun toggleGpsTracking(enabled: Boolean) {
         viewModelScope.launch {
-            val current = repository.getConfigSnapshot()
-            repository.saveConfig(current.copy(gpsTrackingEnabled = enabled))
+            val updated = repository.getConfigSnapshot().copy(gpsTrackingEnabled = enabled)
+            repository.saveConfig(updated)
             val ctx = getApplication<Application>()
+            syncGpsWorkersAndService(updated)
             if (enabled) {
-                if (LocationPermissionHelper.hasForegroundLocationPermission(ctx)) {
-                    LocationPermissionHelper.startTrackingService(ctx)
-                    LocationSyncWorker.schedulePeriodicLocationSync(ctx, true)
-                    _snackbarMessages.tryEmit("সর্বক্ষণিক GPS ট্র্যাকিং চালু হয়েছে")
+                if (!updated.remoteControl.gpsEnabled) {
+                    _snackbarMessages.tryEmit("প্যানেল থেকে GPS ট্র্যাকিং বন্ধ রাখা হয়েছে")
+                } else if (LocationPermissionHelper.hasForegroundLocationPermission(ctx)) {
+                    _snackbarMessages.tryEmit("ব্যাকগ্রাউন্ড GPS চালু — অফলাইনেও সংগ্রহ হবে এবং প্যানেল রিকোয়েস্ট বা ১ ঘণ্টা পর পর পাঠাবে")
                 } else {
                     _snackbarMessages.tryEmit("অনুগ্রহ করে প্রথমে GPS লোকেশন অনুমতি দিন")
                 }
             } else {
-                LocationPermissionHelper.stopTrackingService(ctx)
-                LocationSyncWorker.schedulePeriodicLocationSync(ctx, false)
-                _snackbarMessages.tryEmit("GPS ট্র্যাকিং সাময়িকভাবে বন্ধ করা হয়েছে")
+                _snackbarMessages.tryEmit("GPS ট্র্যাকিং বন্ধ করা হয়েছে — ব্যবহার করতে GPS চালু রাখুন")
             }
         }
     }
@@ -739,52 +1024,89 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
                 _snackbarMessages.tryEmit("অফলাইন আছেন — অনলাইনে আসলেই স্বয়ংক্রিয়ভাবে সব সিঙ্ক হবে")
                 return@launch
             }
-            if (uiState.value.config.gpsTrackingEnabled &&
-                LocationPermissionHelper.hasForegroundLocationPermission(ctx)
-            ) {
-                LocationPermissionHelper.startTrackingService(ctx)
-            }
+            val cfgResult = remoteConfigSyncer.syncConfig()
+            val latest = repository.getConfigSnapshot()
+            syncGpsWorkersAndService(latest)
             locationUploader.flushPendingLocations()
-            runPollCycle(showSnackbarOnError = true)
+            runPollCycle(
+                showSnackbarOnError = true,
+                configUpdated = cfgResult.updated || cfgResult.gpsRequestFulfilled
+            )
         }
     }
 
-    private suspend fun runPollCycle(showSnackbarOnError: Boolean) {
+    private suspend fun runPollCycle(
+        showSnackbarOnError: Boolean,
+        configUpdated: Boolean = false
+    ) {
         if (_isSyncing.value) return
         _isSyncing.value = true
         val result = poller.pollOnce(showSystemNotifications = true)
         _isSyncing.value = false
 
+        val config = repository.getConfigSnapshot()
         if (result.shouldAutoRefreshTasks) {
-            _webViewCommands.tryEmit(WebViewCommand.Reload)
-            _snackbarMessages.tryEmit("টাস্ক আপডেট পাওয়া গেছে — অটো-রিফ্রেশ হয়েছে")
+            tryAutoRefreshTasks(
+                config = config,
+                message = "টাস্ক আপডেট পাওয়া গেছে — অটো-রিফ্রেশ হয়েছে"
+            )
         } else if (result.newNotificationsCount > 0) {
             _snackbarMessages.tryEmit("${result.newNotificationsCount} টি নতুন নোটিফিকেশন এসেছে")
+        } else if (configUpdated) {
+            _snackbarMessages.tryEmit("প্যানেল থেকে নতুন অ্যাপ কনফিগ সিঙ্ক হয়েছে")
         } else if (showSnackbarOnError) {
             _snackbarMessages.tryEmit(result.statusMessage)
         }
+    }
+
+    private fun tryAutoRefreshTasks(config: PortalConfig, message: String) {
+        val rc = config.remoteControl
+        if (!config.autoRefreshOnTaskComplete ||
+            !rc.taskAutoRefreshEnabled ||
+            rc.taskRefreshMode == TaskRefreshMode.OFF
+        ) {
+            return
+        }
+
+        val stateSnapshot = uiState.value
+        val activeWorkspaceIsPrimary = stateSnapshot.activeWorkspaceTab.isPrimaryStore
+        if (rc.refreshOnlyOnTabs.isNotEmpty()) {
+            val activeTab = stateSnapshot.selectedBottomTabId.lowercase()
+            if (!activeWorkspaceIsPrimary || activeTab !in rc.refreshOnlyOnTabs) {
+                return
+            }
+        }
+
+        val now = System.currentTimeMillis()
+        val cooldownMs = rc.refreshCooldownSeconds.coerceIn(5, 3600) * 1000L
+        if (now - lastAutoRefreshMillis < cooldownMs) {
+            return
+        }
+
+        lastAutoRefreshMillis = now
+        _webViewCommands.tryEmit(WebViewCommand.Reload)
+        _snackbarMessages.tryEmit(message)
     }
 
     fun openNotification(notification: StoreNotification) {
         viewModelScope.launch {
             repository.markRead(notification.id)
             val target = notification.targetUrl.ifBlank { uiState.value.config.baseUrl }
-            _selectedWorkspace.value = AppWorkspace.BANGLA_STORE
-            _selectedTab.value = when (notification.type) {
-                NotificationEventType.ATTENDANCE_SUBMITTED -> {
-                    lastWebTab = AppTab.ATTENDANCE
-                    AppTab.ATTENDANCE
-                }
+            val primary = uiState.value.primaryStoreTab
+            _selectedWorkspaceId.value = primary.id
+            val nextTabId = when (notification.type) {
+                NotificationEventType.ATTENDANCE_SUBMITTED -> AppTab.ATTENDANCE.route
                 NotificationEventType.TASK_ASSIGNED,
-                NotificationEventType.TASK_COMPLETED -> {
-                    lastWebTab = AppTab.TASKS
-                    AppTab.TASKS
-                }
-                NotificationEventType.GENERAL -> {
-                    lastWebTab = AppTab.PORTAL
-                    AppTab.PORTAL
-                }
+                NotificationEventType.TASK_COMPLETED -> AppTab.TASKS.route
+                NotificationEventType.GPS_REQUEST,
+                NotificationEventType.GENERAL -> AppTab.PORTAL.route
             }
+            val visibleIds = uiState.value.visibleBottomTabs
+            val resolvedId = visibleIds.firstOrNull { it.id == nextTabId }?.id
+                ?: visibleIds.firstOrNull { it.type == "web" }?.id
+                ?: AppTab.PORTAL.route
+            _selectedBottomTabId.value = resolvedId
+            lastWebBottomTabId = resolvedId
             _webError.value = null
             _isShowingOfflineCache.value = false
             _webViewCommands.tryEmit(WebViewCommand.LoadUrl(target))
@@ -805,6 +1127,117 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         }
     }
 
+    fun attachAiImage(uri: Uri?) {
+        if (uri == null) return
+        viewModelScope.launch {
+            val bitmap = geminiAssistant.decodeScaledBitmap(getApplication(), uri)
+            if (bitmap != null) {
+                _aiState.update { it.copy(attachedBitmap = bitmap) }
+            } else {
+                _snackbarMessages.tryEmit("ছবিটি পড়া যায়নি — অন্য ছবি বেছে নিন")
+            }
+        }
+    }
+
+    fun clearAiImage() {
+        _aiState.update { it.copy(attachedBitmap = null) }
+    }
+
+    fun sendAiPrompt(prompt: String) {
+        val cleanPrompt = prompt.trim()
+        if (cleanPrompt.isEmpty()) return
+        val currentState = _aiState.value
+        if (currentState.generationState is AiGenerationUiState.Loading ||
+            currentState.generationState is AiGenerationUiState.Streaming
+        ) {
+            return
+        }
+
+        val imageToSend = currentState.attachedBitmap
+        val userMsg = AiChatMessage(
+            id = "u_${System.currentTimeMillis()}",
+            isUser = true,
+            text = cleanPrompt,
+            hasImage = imageToSend != null
+        )
+
+        _aiState.update {
+            it.copy(
+                messages = it.messages + userMsg,
+                generationState = AiGenerationUiState.Loading,
+                attachedBitmap = null
+            )
+        }
+
+        viewModelScope.launch {
+            val accumulated = StringBuilder()
+            try {
+                withTimeout(60_000L) {
+                    geminiAssistant.sendMessageStream(cleanPrompt, imageToSend).collect { chunk ->
+                        accumulated.append(chunk)
+                        _aiState.update {
+                            it.copy(
+                                generationState = AiGenerationUiState.Streaming(accumulated.toString())
+                            )
+                        }
+                    }
+                }
+
+                val finalReply = accumulated.toString().trim()
+                if (finalReply.isNotEmpty()) {
+                    val botMsg = AiChatMessage(
+                        id = "m_${System.currentTimeMillis()}",
+                        isUser = false,
+                        text = finalReply
+                    )
+                    _aiState.update {
+                        it.copy(
+                            messages = it.messages + botMsg,
+                            generationState = AiGenerationUiState.Success
+                        )
+                    }
+                } else {
+                    _aiState.update {
+                        it.copy(
+                            generationState = AiGenerationUiState.Error(
+                                "Gemini থেকে কোনো উত্তর পাওয়া যায়নি। আবার চেষ্টা করুন।"
+                            )
+                        )
+                    }
+                }
+            } catch (e: TimeoutCancellationException) {
+                Log.e("BanglaStoreAi", "Gemini request timed out", e)
+                _aiState.update {
+                    it.copy(
+                        generationState = AiGenerationUiState.Error(
+                            "উত্তর তৈরি করতে সময় শেষ হয়েছে (৬০ সেকেন্ড)। অনুগ্রহ করে আবার চেষ্টা করুন।"
+                        )
+                    )
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e("BanglaStoreAi", "Gemini AI generation failed", e)
+                _aiState.update {
+                    it.copy(
+                        generationState = AiGenerationUiState.Error(
+                            e.localizedMessage ?: "Gemini AI অনুরোধ ব্যর্থ হয়েছে।"
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+    fun clearAiChat() {
+        geminiAssistant.resetConversation()
+        _aiState.value = AiAssistantUiState()
+    }
+
+    fun notifyClipboardCopied() {
+        _snackbarMessages.tryEmit("টেক্সট কপি করা হয়েছে")
+    }
+
     fun handleLaunchIntent(intent: Intent?) {
         if (intent == null) return
         val targetUrl = intent.getStringExtra(NotificationHelper.EXTRA_TARGET_URL)
@@ -818,22 +1251,21 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         }
         if (!targetUrl.isNullOrBlank()) {
             val type = NotificationEventType.fromKey(eventType)
-            _selectedWorkspace.value = AppWorkspace.BANGLA_STORE
-            _selectedTab.value = when (type) {
-                NotificationEventType.ATTENDANCE_SUBMITTED -> {
-                    lastWebTab = AppTab.ATTENDANCE
-                    AppTab.ATTENDANCE
-                }
+            val primary = uiState.value.primaryStoreTab
+            _selectedWorkspaceId.value = primary.id
+            val desiredId = when (type) {
+                NotificationEventType.ATTENDANCE_SUBMITTED -> AppTab.ATTENDANCE.route
                 NotificationEventType.TASK_ASSIGNED,
-                NotificationEventType.TASK_COMPLETED -> {
-                    lastWebTab = AppTab.TASKS
-                    AppTab.TASKS
-                }
-                NotificationEventType.GENERAL -> {
-                    lastWebTab = AppTab.PORTAL
-                    AppTab.PORTAL
-                }
+                NotificationEventType.TASK_COMPLETED -> AppTab.TASKS.route
+                NotificationEventType.GPS_REQUEST,
+                NotificationEventType.GENERAL -> AppTab.PORTAL.route
             }
+            val visible = uiState.value.visibleBottomTabs
+            val resolvedId = visible.firstOrNull { it.id == desiredId }?.id
+                ?: visible.firstOrNull { it.type == "web" }?.id
+                ?: AppTab.PORTAL.route
+            _selectedBottomTabId.value = resolvedId
+            lastWebBottomTabId = resolvedId
             _webViewCommands.tryEmit(WebViewCommand.LoadUrl(targetUrl))
         }
     }
@@ -842,6 +1274,12 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         notif: StoreNotification,
         config: PortalConfig
     ): Boolean {
+        if (config.panelId.isNotBlank() &&
+            notif.panelId.isNotBlank() &&
+            !notif.panelId.equals(config.panelId, ignoreCase = true)
+        ) {
+            return false
+        }
         val roleMatches = notif.targetRole == "all" ||
             notif.targetRole.equals(config.userRole.key, ignoreCase = true)
         if (!roleMatches) return false
@@ -851,6 +1289,7 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     override fun onCleared() {
+        runCatching { getApplication<Application>().unregisterReceiver(providerChangedReceiver) }
         networkMonitor.unregister()
         super.onCleared()
     }

@@ -236,19 +236,19 @@ private fun NotificationCard(
         NotificationEventType.ATTENDANCE_SUBMITTED -> Icons.Rounded.PersonPinCircle
         NotificationEventType.TASK_ASSIGNED -> Icons.Rounded.AssignmentInd
         NotificationEventType.TASK_COMPLETED -> Icons.Rounded.CheckCircle
-        NotificationEventType.GENERAL -> Icons.Rounded.NotificationsActive
+        NotificationEventType.GPS_REQUEST, NotificationEventType.GENERAL -> Icons.Rounded.NotificationsActive
     }
     val badgeContainerColor = when (notification.type) {
         NotificationEventType.ATTENDANCE_SUBMITTED -> MaterialTheme.colorScheme.primaryContainer
         NotificationEventType.TASK_ASSIGNED -> MaterialTheme.colorScheme.tertiaryContainer
         NotificationEventType.TASK_COMPLETED -> MaterialTheme.colorScheme.secondaryContainer
-        NotificationEventType.GENERAL -> MaterialTheme.colorScheme.surfaceVariant
+        NotificationEventType.GPS_REQUEST, NotificationEventType.GENERAL -> MaterialTheme.colorScheme.surfaceVariant
     }
     val badgeContentColor = when (notification.type) {
         NotificationEventType.ATTENDANCE_SUBMITTED -> MaterialTheme.colorScheme.onPrimaryContainer
         NotificationEventType.TASK_ASSIGNED -> MaterialTheme.colorScheme.onTertiaryContainer
         NotificationEventType.TASK_COMPLETED -> MaterialTheme.colorScheme.onSecondaryContainer
-        NotificationEventType.GENERAL -> MaterialTheme.colorScheme.onSurfaceVariant
+        NotificationEventType.GPS_REQUEST, NotificationEventType.GENERAL -> MaterialTheme.colorScheme.onSurfaceVariant
     }
 
     Card(
