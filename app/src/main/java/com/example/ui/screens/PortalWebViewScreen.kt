@@ -315,6 +315,17 @@ fun PortalWebViewScreen(
         }
     }
 
+    var appliedConfiguredUrl by remember { mutableStateOf(initialUrl) }
+    LaunchedEffect(initialUrl) {
+        if (initialUrl.isNotBlank() && !initialUrl.equals(appliedConfiguredUrl, ignoreCase = true)) {
+            appliedConfiguredUrl = initialUrl
+            currentOnErrorChanged(null)
+            currentOnOfflineCacheModeChanged(false)
+            lastFailedFallbackUrl = null
+            webView.loadUrl(initialUrl)
+        }
+    }
+
     LaunchedEffect(isOnline) {
         webView.settings.cacheMode = if (isOnline) {
             WebSettings.LOAD_DEFAULT
