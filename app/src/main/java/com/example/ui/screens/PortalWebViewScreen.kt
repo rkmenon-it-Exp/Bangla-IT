@@ -83,6 +83,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 import com.example.R
 import com.example.location.LocationPermissionHelper
+import com.example.sync.RemoteConfigSyncer
 import com.example.ui.WebViewCommand
 import com.example.webview.BanglaStoreBridge
 import com.example.webview.CachedPageSnapshot
@@ -118,6 +119,9 @@ fun PortalWebViewScreen(
     onOpenAlerts: () -> Unit,
     onManualRefresh: () -> Unit,
     isInnerScrolledProvider: () -> Boolean,
+    extraHeadersProvider: () -> Map<String, String> = { emptyMap() },
+    boundStoreRootUrl: String = "",
+    boundLoginUrl: String = "",
     useFullStoreHooks: Boolean = true,
     tagPrefix: String = "portal",
     modifier: Modifier = Modifier
@@ -131,6 +135,9 @@ fun PortalWebViewScreen(
     val currentOnManualRefresh by rememberUpdatedState(onManualRefresh)
     val currentOnErrorChanged by rememberUpdatedState(onErrorChanged)
     val currentIsInnerScrolled by rememberUpdatedState(isInnerScrolledProvider)
+    val currentExtraHeadersProvider by rememberUpdatedState(extraHeadersProvider)
+    val currentBoundStoreRootUrl by rememberUpdatedState(boundStoreRootUrl)
+    val currentBoundLoginUrl by rememberUpdatedState(boundLoginUrl)
     val currentOnSnapshotCaptured by rememberUpdatedState(onSnapshotCaptured)
     val currentOnOfflineCacheModeChanged by rememberUpdatedState(onOfflineCacheModeChanged)
 
@@ -215,6 +222,16 @@ fun PortalWebViewScreen(
             }
             webViewClient = object : WebViewClient() {
                 override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                    if (useFullStoreHooks &&
+                        !url.isNullOrBlank() &&
+                        currentBoundStoreRootUrl.isNotBlank() &&
+                        currentBoundLoginUrl.isNotBlank() &&
+                        RemoteConfigSyncer.isGlobalPortalUrlForBoundStore(url, currentBoundStoreRootUrl)
+                    ) {
+                        view?.stopLoading()
+                        view?.loadUrl(currentBoundLoginUrl, currentExtraHeadersProvider())
+                        return
+                    }
                     currentOnErrorChanged(null)
                     onProgressChanged(5)
                     onNavigationChanged(url, view?.canGoBack() ?: false)
@@ -266,6 +283,16 @@ fun PortalWebViewScreen(
                     val uri = request?.url ?: return false
                     val scheme = uri.scheme?.lowercase().orEmpty()
                     if (scheme == "http" || scheme == "https") {
+                        val urlString = uri.toString()
+                        if (useFullStoreHooks &&
+                            request.isForMainFrame &&
+                            currentBoundStoreRootUrl.isNotBlank() &&
+                            currentBoundLoginUrl.isNotBlank() &&
+                            RemoteConfigSyncer.isGlobalPortalUrlForBoundStore(urlString, currentBoundStoreRootUrl)
+                        ) {
+                            view?.loadUrl(currentBoundLoginUrl, currentExtraHeadersProvider())
+                            return true
+                        }
                         return false
                     }
                     runCatching {
@@ -311,7 +338,7 @@ fun PortalWebViewScreen(
                     }
                 }
             }
-            loadUrl(initialUrl)
+            loadUrl(initialUrl, currentExtraHeadersProvider())
         }
     }
 
@@ -322,7 +349,7 @@ fun PortalWebViewScreen(
             currentOnErrorChanged(null)
             currentOnOfflineCacheModeChanged(false)
             lastFailedFallbackUrl = null
-            webView.loadUrl(initialUrl)
+            webView.loadUrl(initialUrl, currentExtraHeadersProvider())
         }
     }
 
@@ -372,7 +399,7 @@ fun PortalWebViewScreen(
                     } else {
                         WebSettings.LOAD_CACHE_ELSE_NETWORK
                     }
-                    webView.loadUrl(command.url)
+                    webView.loadUrl(command.url, currentExtraHeadersProvider())
                 }
                 is WebViewCommand.LoadHtmlSnapshot -> {
                     currentOnErrorChanged(null)

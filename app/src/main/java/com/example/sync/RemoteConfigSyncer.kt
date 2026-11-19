@@ -48,6 +48,13 @@ class RemoteConfigSyncer(
 
     suspend fun syncConfig(): RemoteConfigSyncResult = withContext(Dispatchers.IO) {
         val config = repository.getConfigSnapshot()
+        if (!config.isCustomStoreBound || config.configApiUrl.isBlank()) {
+            return@withContext RemoteConfigSyncResult(
+                success = false,
+                updated = false,
+                statusMessage = "কোনো শপ বাইন্ড করা নেই"
+            )
+        }
         val deviceId = repository.getOrCreateUniqueDeviceId()
         val requestUrl = buildConfigUrl(config)
         val cookie = runCatching { CookieManager.getInstance().getCookie(config.baseUrl) }
@@ -57,10 +64,9 @@ class RemoteConfigSyncer(
         val requestBuilder = Request.Builder()
             .url(requestUrl)
             .header("Accept", "application/json")
-            .header("X-Device-Id", deviceId)
-            .header("X-Device-Model", Build.MODEL.orEmpty())
-            .header("X-OS-Version", "Android ${Build.VERSION.RELEASE.orEmpty()}")
-            .header("X-App-Version", BuildConfig.VERSION_NAME)
+        DeviceTelemetryHelper.buildRequestHeaders(context, deviceId).forEach { (k, v) ->
+            requestBuilder.header(k, v)
+        }
         if (cookie.isNotBlank()) {
             requestBuilder.header("Cookie", cookie)
         }
@@ -115,13 +121,15 @@ class RemoteConfigSyncer(
                     )
                 }
 
+                val boundRoot = config.boundStoreUrl.trim().trimEnd('/')
                 val parsed = parseRemoteControlSettings(
                     sourceObj = rootObj,
                     fallbackBaseUrl = config.baseUrl,
                     fallbackAttendanceUrl = config.attendanceUrl,
                     fallbackTasksUrl = config.tasksUrl,
                     fallbackPrimaryLabel = config.effectiveStoreDisplayName,
-                    includeDefaultIsp = !config.isCustomStoreBound
+                    includeDefaultIsp = !config.isCustomStoreBound,
+                    boundStoreRootUrl = boundRoot
                 )
                     ?: return@withContext RemoteConfigSyncResult(
                         success = false,
@@ -129,8 +137,15 @@ class RemoteConfigSyncer(
                         statusMessage = "কনফিগ পার্স করা যায়নি"
                     )
 
-                val urlOverrides = extractUrlOverrides(rootObj, config.baseUrl)
-                val brandingUpdate = extractBrandingUpdate(rootObj, config.baseUrl)
+                val rawOverrides = extractUrlOverrides(rootObj, boundRoot.ifBlank { config.baseUrl })
+                val urlOverrides = rawOverrides.filter { (k, v) ->
+                    if (k == "base_url" && boundRoot.isNotBlank()) {
+                        !isGlobalPortalUrlForBoundStore(v, boundRoot)
+                    } else {
+                        true
+                    }
+                }
+                val brandingUpdate = extractBrandingUpdate(rootObj, boundRoot.ifBlank { config.baseUrl })
                 repository.saveRemoteControl(parsed, urlOverrides, brandingUpdate)
 
                 val latestConfig = repository.getConfigSnapshot()
@@ -303,7 +318,8 @@ class RemoteConfigSyncer(
             fallbackAttendanceUrl: String = DEFAULT_ATTENDANCE_URL,
             fallbackTasksUrl: String = DEFAULT_TASKS_URL,
             fallbackPrimaryLabel: String = "বাংলা স্টোর",
-            includeDefaultIsp: Boolean = true
+            includeDefaultIsp: Boolean = true,
+            boundStoreRootUrl: String = ""
         ): RemoteControlSettings? {
             val obj = sourceObj.optJSONObject("app_config")
                 ?: sourceObj.optJSONObject("config")
@@ -336,21 +352,48 @@ class RemoteConfigSyncer(
                 tasksUrl = fallbackTasksUrl
             )
 
-            val parsedTopTabs = parseTopTabs(obj.optJSONArray("top_tabs"), fallbackBaseUrl)
+            val relativeBase = boundStoreRootUrl.trim().trimEnd('/').ifBlank { fallbackBaseUrl }
+            val parsedTopTabs = parseTopTabs(obj.optJSONArray("top_tabs"), relativeBase)
                 .ifEmpty { defaultTop }
                 .let { list ->
-                    if (list.any { it.isPrimaryStore }) {
+                    val withPrimary = if (list.any { it.isPrimaryStore }) {
                         list
                     } else {
                         list.mapIndexed { idx, tab ->
                             if (idx == 0) tab.copy(isPrimaryStore = true) else tab
                         }
                     }
+                    if (boundStoreRootUrl.isNotBlank()) {
+                        withPrimary.map { tab ->
+                            if (tab.isPrimaryStore && isGlobalPortalUrlForBoundStore(tab.url, boundStoreRootUrl)) {
+                                tab.copy(url = fallbackBaseUrl)
+                            } else {
+                                tab
+                            }
+                        }
+                    } else {
+                        withPrimary
+                    }
                 }
 
             val bottomJsonArray = obj.optJSONArray("bottom_tabs") ?: obj.optJSONArray("bottom_nav")
-            val parsedBottomTabs = parseBottomTabs(bottomJsonArray, fallbackBaseUrl)
+            val parsedBottomTabs = parseBottomTabs(bottomJsonArray, relativeBase)
                 .ifEmpty { defaultBottom }
+                .let { list ->
+                    if (boundStoreRootUrl.isNotBlank()) {
+                        list.map { tab ->
+                            if (tab.id.equals("portal", ignoreCase = true) &&
+                                isGlobalPortalUrlForBoundStore(tab.url, boundStoreRootUrl)
+                            ) {
+                                tab.copy(url = fallbackBaseUrl)
+                            } else {
+                                tab
+                            }
+                        }
+                    } else {
+                        list
+                    }
+                }
 
             val allowedEvents = parseStringList(
                 notifObj.optJSONArray("allowed_event_types")
@@ -486,6 +529,43 @@ class RemoteConfigSyncer(
                     if (value.isNotBlank()) add(value)
                 }
             }
+        }
+
+        /**
+         * Returns true if [candidateUrl] points to the global portal/login root (e.g. `https://banglait.net/shop`,
+         * `https://banglait.net/shop/`, `https://banglait.net/shop/login`, `https://banglait.net/shop/login.php`)
+         * when the app is bound to a specific tenant store subpath like `https://banglait.net/shop/store1`.
+         */
+        fun isGlobalPortalUrlForBoundStore(candidateUrl: String, boundStoreRootUrl: String): Boolean {
+            val cleanBound = boundStoreRootUrl.trim().trimEnd('/')
+            val cleanCandidate = candidateUrl.trim().trimEnd('/')
+            if (cleanBound.isBlank() || cleanCandidate.isBlank()) return false
+
+            val boundUri = runCatching { Uri.parse(cleanBound) }.getOrNull() ?: return false
+            val candUri = runCatching { Uri.parse(cleanCandidate) }.getOrNull() ?: return false
+            val boundHost = boundUri.host.orEmpty().lowercase()
+            val candHost = candUri.host.orEmpty().lowercase()
+            if (boundHost.isBlank() || candHost != boundHost) return false
+
+            val boundPath = boundUri.path.orEmpty().trimEnd('/').lowercase()
+            val candPath = candUri.path.orEmpty().trimEnd('/').lowercase()
+
+            // If bound to a subpath (e.g., /shop/store1), a candidate path that is a strict parent/global login
+            // without the bound subpath (e.g. "", "/shop", "/shop/login", "/shop/login.php", "/login", "/login.php")
+            // must be rewritten to the bound store's login URL.
+            if (boundPath.isNotBlank() && !candPath.startsWith(boundPath)) {
+                val parentPath = boundPath.substringBeforeLast('/', missingDelimiterValue = "")
+                val isParentRoot = candPath.isBlank() ||
+                    candPath == parentPath ||
+                    candPath == "$parentPath/index.php" ||
+                    candPath == "$parentPath/login" ||
+                    candPath == "$parentPath/login.php" ||
+                    candPath == "/login" ||
+                    candPath == "/login.php"
+                if (isParentRoot) return true
+            }
+
+            return false
         }
 
         fun resolveUrlAgainstBase(raw: String, baseUrl: String): String {

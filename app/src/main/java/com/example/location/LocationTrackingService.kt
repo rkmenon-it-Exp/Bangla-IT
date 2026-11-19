@@ -103,7 +103,8 @@ class LocationTrackingService : Service() {
     private suspend fun handleLocationFixInBackground(location: Location) {
         val config = repository.getConfigSnapshot()
         val remote = config.remoteControl
-        if (!config.gpsTrackingEnabled ||
+        if (!config.isCustomStoreBound ||
+            !config.gpsTrackingEnabled ||
             !remote.gpsEnabled ||
             remote.gpsMode == GpsCollectionMode.OFF
         ) {
@@ -174,6 +175,8 @@ class LocationTrackingService : Service() {
                         ImmediateSyncWorker.scheduleOnReconnect(applicationContext)
                     } else if (!wasOnline) {
                         wasOnline = true
+                        val initialCfg = repository.getConfigSnapshot()
+                        if (!initialCfg.isCustomStoreBound) return@collect
                         // Back online even when app is closed:
                         // 1. Check panel config & any panel GPS request
                         remoteConfigSyncer.syncConfig()
@@ -211,7 +214,8 @@ class LocationTrackingService : Service() {
         serviceScope.launch {
             repository.configFlow
                 .map { config ->
-                    val enabled = config.gpsTrackingEnabled &&
+                    val enabled = config.isCustomStoreBound &&
+                        config.gpsTrackingEnabled &&
                         config.remoteControl.gpsEnabled &&
                         config.remoteControl.gpsBackgroundEnabled &&
                         config.remoteControl.gpsMode != GpsCollectionMode.OFF
@@ -269,7 +273,8 @@ class LocationTrackingService : Service() {
             isTrackingStarted = true
             serviceScope.launch {
                 val cfg = repository.getConfigSnapshot()
-                if (!cfg.gpsTrackingEnabled ||
+                if (!cfg.isCustomStoreBound ||
+                    !cfg.gpsTrackingEnabled ||
                     !cfg.remoteControl.gpsEnabled ||
                     cfg.remoteControl.gpsMode == GpsCollectionMode.OFF
                 ) {

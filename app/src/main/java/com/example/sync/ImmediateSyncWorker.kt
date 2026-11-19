@@ -24,9 +24,14 @@ class ImmediateSyncWorker(
 
     override suspend fun doWork(): Result {
         val repository = StorePreferencesRepository(applicationContext)
+        val initial = repository.getConfigSnapshot()
+        if (!initial.isCustomStoreBound) {
+            return Result.success()
+        }
         // 1. Fetch panel config & fulfill any explicit panel GPS request right away
         RemoteConfigSyncer(applicationContext, repository).syncConfig()
         val config = repository.getConfigSnapshot()
+        if (!config.isCustomStoreBound) return Result.success()
         val uploader = LocationUploader(applicationContext, repository)
 
         // 2. Calculate elapsed time since previous server upload (or permission anchor):

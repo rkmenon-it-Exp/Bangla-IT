@@ -1,5 +1,6 @@
 package com.example.webview
 
+import android.os.Build
 import android.webkit.JavascriptInterface
 import com.example.model.LocationSnapshot
 import com.example.model.NotificationEventType
@@ -17,7 +18,10 @@ class BanglaStoreBridge(
     private val onGpsRequestedCallback: (String) -> Unit = {},
     private val onInnerScrollChangedCallback: (Boolean) -> Unit,
     private val locationSnapshotProvider: () -> LocationSnapshot,
-    private val deviceInfoProvider: () -> String = { "{}" }
+    private val deviceInfoProvider: () -> String = { "{}" },
+    private val deviceIdProvider: () -> String = { "" },
+    private val deviceModelProvider: () -> String = { Build.MODEL.orEmpty() },
+    private val batteryLevelProvider: () -> Int = { -1 }
 ) {
 
     @JavascriptInterface
@@ -67,6 +71,15 @@ class BanglaStoreBridge(
 
     @JavascriptInterface
     fun getDeviceInfoJson(): String = deviceInfoProvider()
+
+    @JavascriptInterface
+    fun getDeviceId(): String = deviceIdProvider()
+
+    @JavascriptInterface
+    fun getDeviceModel(): String = deviceModelProvider()
+
+    @JavascriptInterface
+    fun getBatteryLevel(): Int = batteryLevelProvider()
 
     @JavascriptInterface
     fun onAttendanceSubmitted(

@@ -5,9 +5,11 @@ import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
@@ -48,6 +50,8 @@ import androidx.compose.material.icons.rounded.GpsFixed
 import androidx.compose.material.icons.rounded.GpsOff
 import androidx.compose.material.icons.rounded.Group
 import androidx.compose.material.icons.rounded.Language
+import androidx.compose.material.icons.rounded.Link
+import androidx.compose.material.icons.rounded.LinkOff
 import androidx.compose.material.icons.rounded.Notifications
 import androidx.compose.material.icons.rounded.PersonPinCircle
 import androidx.compose.material.icons.rounded.ReceiptLong
@@ -60,6 +64,8 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -104,15 +110,17 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.SubcomposeAsyncImage
 import com.example.R
 import com.example.location.LocationPermissionHelper
+import com.example.model.DEFAULT_GENERIC_PORTAL_URL
 import com.example.model.GpsCollectionMode
 import com.example.model.RemoteBottomTab
 import com.example.ui.screens.AlertsInboxScreen
 import com.example.ui.screens.PortalWebViewScreen
+import com.example.ui.screens.QrCodeScannerDialog
 import com.example.ui.screens.SettingsBottomSheet
 import com.example.ui.screens.ShopBindingBottomSheet
 import kotlinx.coroutines.launch
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun BanglaStoreApp(
     viewModel: BanglaStoreViewModel,
@@ -127,6 +135,8 @@ fun BanglaStoreApp(
     var askedInitialPermissions by remember { mutableStateOf(false) }
     var showSettingsSheet by remember { mutableStateOf(false) }
     var showShopBindingSheet by remember { mutableStateOf(false) }
+    var showQrScannerDialog by remember { mutableStateOf(false) }
+    var showQuickUnlinkDialog by remember { mutableStateOf(false) }
 
     val initialPermissionsLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
@@ -173,8 +183,9 @@ fun BanglaStoreApp(
         viewModel.onPermissionsUpdated(allowBackgroundPrompt = true)
     }
 
-    LaunchedEffect(Unit) {
-        if (!askedInitialPermissions) {
+    // Only request GPS/Notification permissions once a store is actually bound
+    LaunchedEffect(uiState.isConfigLoaded, uiState.config.isCustomStoreBound) {
+        if (uiState.isConfigLoaded && uiState.config.isCustomStoreBound && !askedInitialPermissions) {
             askedInitialPermissions = true
             val permsToRequest = buildList {
                 if (!uiState.hasForegroundLocationPermission) {
@@ -201,11 +212,29 @@ fun BanglaStoreApp(
         }
     }
 
-    val showAlertsOverlay = uiState.isAlertsOverlayVisible
+    // Wait for persisted DataStore config before mounting the WebView so a bound store
+    // never loads the global portal URL on frame 1.
+    if (!uiState.isConfigLoaded) {
+        Surface(
+            color = MaterialTheme.colorScheme.background,
+            modifier = modifier.fillMaxSize()
+        ) {
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier.fillMaxSize()
+            ) {
+                CircularProgressIndicator()
+            }
+        }
+        return
+    }
+
+    val isStoreBound = uiState.config.isCustomStoreBound
+    val showAlertsOverlay = isStoreBound && uiState.isAlertsOverlayVisible
     val activeWorkspace = uiState.activeWorkspaceTab
     val primaryStoreTab = uiState.primaryStoreTab
-    val isPrimaryWorkspaceActive = !showAlertsOverlay && activeWorkspace.isPrimaryStore
-    val activeSecondaryState = if (!activeWorkspace.isPrimaryStore) {
+    val isPrimaryWorkspaceActive = !showAlertsOverlay && (!isStoreBound || activeWorkspace.isPrimaryStore)
+    val activeSecondaryState = if (isStoreBound && !activeWorkspace.isPrimaryStore) {
         uiState.secondaryWebStates[activeWorkspace.id]
     } else {
         null
@@ -213,11 +242,12 @@ fun BanglaStoreApp(
 
     val activeCanGoBack = when {
         showAlertsOverlay -> false
-        activeWorkspace.isPrimaryStore -> uiState.canGoBack
+        !isStoreBound || activeWorkspace.isPrimaryStore -> uiState.canGoBack
         else -> activeSecondaryState?.canGoBack ?: false
     }
 
-    val gpsRequiredByPanel = uiState.config.remoteControl.gpsEnabled &&
+    val gpsRequiredByPanel = isStoreBound &&
+        uiState.config.remoteControl.gpsEnabled &&
         uiState.config.remoteControl.gpsMode != GpsCollectionMode.OFF
     val isGpsBlocked = gpsRequiredByPanel && (
         !uiState.hasForegroundLocationPermission ||
@@ -229,6 +259,7 @@ fun BanglaStoreApp(
         if (isGpsBlocked) {
             showSettingsSheet = false
             showShopBindingSheet = false
+            showQrScannerDialog = false
         }
     }
 
@@ -240,16 +271,16 @@ fun BanglaStoreApp(
         viewModel.exitAlertsScreen()
     }
 
-    BackHandler(enabled = !isGpsBlocked && !showAlertsOverlay && !activeWorkspace.isPrimaryStore && !activeCanGoBack) {
+    BackHandler(enabled = !isGpsBlocked && isStoreBound && !showAlertsOverlay && !activeWorkspace.isPrimaryStore && !activeCanGoBack) {
         viewModel.selectPrimaryWorkspace()
     }
 
-    val bottomNavTabs = remember(uiState.visibleBottomTabs) {
-        uiState.visibleBottomTabs.take(5)
+    val bottomNavTabs = remember(isStoreBound, uiState.visibleBottomTabs) {
+        if (isStoreBound) uiState.visibleBottomTabs.take(5) else emptyList()
     }
 
     BoxWithConstraints(modifier = modifier.fillMaxSize()) {
-        val useRail = maxWidth >= 600.dp
+        val useRail = maxWidth >= 600.dp && bottomNavTabs.isNotEmpty()
 
         Scaffold(
             contentWindowInsets = WindowInsets.safeDrawing,
@@ -282,10 +313,17 @@ fun BanglaStoreApp(
                                 modifier = Modifier
                                     .size(48.dp)
                                     .clip(RoundedCornerShape(12.dp))
-                                    .clickable {
-                                        viewModel.clearShopBindingError()
-                                        showShopBindingSheet = true
-                                    }
+                                    .combinedClickable(
+                                        onClick = {
+                                            viewModel.clearShopBindingError()
+                                            showShopBindingSheet = true
+                                        },
+                                        onLongClick = {
+                                            if (isStoreBound) {
+                                                showQuickUnlinkDialog = true
+                                            }
+                                        }
+                                    )
                                     .testTag("top_store_logo_button")
                             ) {
                                 Box(
@@ -293,7 +331,7 @@ fun BanglaStoreApp(
                                         .size(36.dp)
                                         .clip(RoundedCornerShape(10.dp))
                                 ) {
-                                    if (uiState.config.logoUrl.isNotBlank()) {
+                                    if (isStoreBound && uiState.config.logoUrl.isNotBlank()) {
                                         SubcomposeAsyncImage(
                                             model = uiState.config.logoUrl,
                                             contentDescription = stringResource(R.string.cd_shop_binding_logo),
@@ -323,94 +361,158 @@ fun BanglaStoreApp(
                                         .padding(4.dp)
                                         .size(10.dp)
                                         .clip(CircleShape)
-                                        .background(MaterialTheme.colorScheme.primary)
+                                        .background(
+                                            if (isStoreBound) {
+                                                MaterialTheme.colorScheme.primary
+                                            } else {
+                                                MaterialTheme.colorScheme.outlineVariant
+                                            }
+                                        )
                                 )
                             }
                         }
                     },
                     title = {
-                        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                            Surface(
-                                shape = RoundedCornerShape(12.dp),
-                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f),
-                                modifier = Modifier.testTag("top_workspace_tabs")
+                        if (!isStoreBound) {
+                            Column(
+                                verticalArrangement = Arrangement.spacedBy(2.dp),
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .clickable {
+                                        viewModel.clearShopBindingError()
+                                        showShopBindingSheet = true
+                                    }
+                                    .padding(vertical = 2.dp, horizontal = 4.dp)
+                                    .testTag("top_unbound_connect_header")
                             ) {
                                 Row(
-                                    modifier = Modifier
-                                        .horizontalScroll(rememberScrollState())
-                                        .padding(3.dp),
-                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                                    verticalAlignment = Alignment.CenterVertically
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
                                 ) {
-                                    uiState.visibleTopTabs.forEach { topTab ->
-                                        TopWorkspaceTabChip(
-                                            label = topTab.label,
-                                            icon = resolveTabIcon(
-                                                iconKey = topTab.icon,
-                                                selected = uiState.selectedWorkspaceId == topTab.id
-                                            ),
-                                            selected = uiState.selectedWorkspaceId == topTab.id,
-                                            onClick = { viewModel.selectWorkspace(topTab) },
-                                            modifier = Modifier.testTag("workspace_tab_${topTab.id}")
-                                        )
+                                    Text(
+                                        text = stringResource(R.string.app_name),
+                                        style = MaterialTheme.typography.titleMedium,
+                                        fontWeight = FontWeight.Bold,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Surface(
+                                        shape = RoundedCornerShape(8.dp),
+                                        color = MaterialTheme.colorScheme.primaryContainer
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(3.dp)
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Rounded.Link,
+                                                contentDescription = null,
+                                                tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                                modifier = Modifier.size(12.dp)
+                                            )
+                                            Text(
+                                                text = "কানেক্ট করুন",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                                fontWeight = FontWeight.SemiBold,
+                                                maxLines = 1
+                                            )
+                                        }
                                     }
                                 }
-                            }
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(6.dp)
-                            ) {
-                                val gpsActive = uiState.hasForegroundLocationPermission &&
-                                    uiState.isDeviceGpsEnabled &&
-                                    uiState.config.gpsTrackingEnabled &&
-                                    uiState.config.remoteControl.gpsEnabled
-                                Box(
-                                    modifier = Modifier
-                                        .size(7.dp)
-                                        .clip(CircleShape)
-                                        .background(
-                                            if (gpsActive) {
-                                                MaterialTheme.colorScheme.primary
-                                            } else {
-                                                MaterialTheme.colorScheme.tertiary
-                                            }
-                                        )
-                                )
                                 Text(
-                                    text = buildString {
-                                        if (!activeWorkspace.isPrimaryStore) {
-                                            append(activeWorkspace.label)
-                                        } else {
-                                            append(uiState.config.userRole.shortLabel)
-                                            if (uiState.config.userId.isNotBlank()) {
-                                                append(" (")
-                                                append(uiState.config.userId)
-                                                append(")")
-                                            }
-                                        }
-                                        val panelBadge = uiState.config.remoteControl.panelName
-                                            .ifBlank { uiState.config.panelId }
-                                        if (panelBadge.isNotBlank()) {
-                                            append(" • ")
-                                            append(panelBadge)
-                                        }
-                                        append(" • ")
-                                        append(
-                                            when {
-                                                !uiState.isOnline -> "Offline"
-                                                gpsActive -> "Online • GPS"
-                                                else -> "Online"
-                                            }
-                                        )
-                                        if (uiState.pendingSyncCount > 0) {
-                                            append(" (${uiState.pendingSyncCount} queued)")
-                                        }
-                                    },
+                                    text = "লোগো ট্যাপ করুন বা সেটিংসে QR স্ক্যান করুন",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
                                 )
+                            }
+                        } else {
+                            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                Surface(
+                                    shape = RoundedCornerShape(12.dp),
+                                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f),
+                                    modifier = Modifier.testTag("top_workspace_tabs")
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .horizontalScroll(rememberScrollState())
+                                            .padding(3.dp),
+                                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        uiState.visibleTopTabs.forEach { topTab ->
+                                            TopWorkspaceTabChip(
+                                                label = topTab.label,
+                                                icon = resolveTabIcon(
+                                                    iconKey = topTab.icon,
+                                                    selected = uiState.selectedWorkspaceId == topTab.id
+                                                ),
+                                                selected = uiState.selectedWorkspaceId == topTab.id,
+                                                onClick = { viewModel.selectWorkspace(topTab) },
+                                                modifier = Modifier.testTag("workspace_tab_${topTab.id}")
+                                            )
+                                        }
+                                    }
+                                }
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    val gpsActive = uiState.hasForegroundLocationPermission &&
+                                        uiState.isDeviceGpsEnabled &&
+                                        uiState.config.gpsTrackingEnabled &&
+                                        uiState.config.remoteControl.gpsEnabled
+                                    Box(
+                                        modifier = Modifier
+                                            .size(7.dp)
+                                            .clip(CircleShape)
+                                            .background(
+                                                if (gpsActive) {
+                                                    MaterialTheme.colorScheme.primary
+                                                } else {
+                                                    MaterialTheme.colorScheme.tertiary
+                                                }
+                                            )
+                                    )
+                                    Text(
+                                        text = buildString {
+                                            if (!activeWorkspace.isPrimaryStore) {
+                                                append(activeWorkspace.label)
+                                            } else {
+                                                append(uiState.config.userRole.shortLabel)
+                                                if (uiState.config.userId.isNotBlank()) {
+                                                    append(" (")
+                                                    append(uiState.config.userId)
+                                                    append(")")
+                                                }
+                                            }
+                                            val panelBadge = uiState.config.remoteControl.panelName
+                                                .ifBlank { uiState.config.storeCode.ifBlank { uiState.config.panelId } }
+                                            if (panelBadge.isNotBlank()) {
+                                                append(" • ")
+                                                append(panelBadge)
+                                            }
+                                            append(" • ")
+                                            append(
+                                                when {
+                                                    !uiState.isOnline -> "Offline"
+                                                    gpsActive -> "Online • GPS"
+                                                    else -> "Online"
+                                                }
+                                            )
+                                            if (uiState.pendingSyncCount > 0) {
+                                                append(" (${uiState.pendingSyncCount} queued)")
+                                            }
+                                        },
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
                             }
                         }
                     },
@@ -437,7 +539,7 @@ fun BanglaStoreApp(
                 )
             },
             bottomBar = {
-                if (!useRail) {
+                if (!useRail && bottomNavTabs.isNotEmpty()) {
                     NavigationBar {
                         bottomNavTabs.forEach { tab ->
                             val selected = if (tab.type == "alerts") {
@@ -501,98 +603,142 @@ fun BanglaStoreApp(
                 }
 
                 Box(modifier = Modifier.fillMaxSize()) {
-                    // Primary workspace WebView (always alive)
-                    key(primaryStoreTab.id) {
-                        val primaryVisible = !showAlertsOverlay &&
-                            uiState.selectedWorkspaceId == primaryStoreTab.id
-                        PortalWebViewScreen(
-                            initialUrl = primaryStoreTab.url.ifBlank { uiState.config.baseUrl },
-                            isVisible = primaryVisible,
-                            isOnline = uiState.isOnline,
-                            pendingSyncCount = uiState.pendingSyncCount,
-                            pageProgress = uiState.pageProgress,
-                            canGoBack = uiState.canGoBack,
-                            webError = uiState.webError,
-                            isShowingOfflineCache = uiState.isShowingOfflineCache,
-                            cachedPages = uiState.cachedPages,
-                            offlinePageCache = viewModel.offlinePageCache,
-                            jsBridge = viewModel.jsBridge,
-                            commands = viewModel.webViewCommands,
-                            onProgressChanged = viewModel::updateWebProgress,
-                            onNavigationChanged = viewModel::updateWebNavigationState,
-                            onErrorChanged = viewModel::setWebError,
-                            onSessionCookieCaptured = viewModel::onSessionCookieCaptured,
-                            onLogoutUrlVisited = viewModel::onLogoutUrlVisited,
-                            onSnapshotCaptured = viewModel::saveCachedPageSnapshot,
-                            onOfflineCacheModeChanged = viewModel::setShowingOfflineCache,
-                            onSelectCachedSnapshot = viewModel::openCachedSnapshot,
-                            onShowCustomOfflineScreen = viewModel::showCustomOfflineScreen,
-                            onOpenAlerts = { viewModel.openAlertsTab() },
-                            onManualRefresh = {
-                                viewModel.reloadCurrentWebPage()
-                                viewModel.syncNow()
-                            },
-                            isInnerScrolledProvider = { viewModel.isWebInnerScrolled },
-                            useFullStoreHooks = true,
-                            tagPrefix = primaryStoreTab.id,
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .zIndex(if (primaryVisible) 2f else 0f)
-                        )
-                    }
-
-                    // Dynamic secondary top workspaces (e.g., ISP or any panel-configured tabs), kept alive once opened
-                    uiState.visibleTopTabs
-                        .filter { !it.isPrimaryStore && it.id in uiState.openedWorkspaceIds }
-                        .forEach { topTab ->
-                            key(topTab.id) {
-                                val tabVisible = !showAlertsOverlay && uiState.selectedWorkspaceId == topTab.id
-                                val secState = uiState.secondaryWebStates[topTab.id]
-                                    ?: SecondaryWebState(workspaceId = topTab.id, currentUrl = topTab.url)
-
-                                PortalWebViewScreen(
-                                    initialUrl = topTab.url,
-                                    isVisible = tabVisible,
-                                    isOnline = uiState.isOnline,
-                                    pendingSyncCount = uiState.pendingSyncCount,
-                                    pageProgress = secState.pageProgress,
-                                    canGoBack = secState.canGoBack,
-                                    webError = secState.webError,
-                                    isShowingOfflineCache = secState.isShowingOfflineCache,
-                                    cachedPages = uiState.cachedPages,
-                                    offlinePageCache = viewModel.offlinePageCache,
-                                    jsBridge = viewModel.getSecondaryBridge(topTab.id),
-                                    commands = viewModel.getSecondaryCommands(topTab.id),
-                                    onProgressChanged = { p -> viewModel.updateSecondaryProgress(topTab.id, p) },
-                                    onNavigationChanged = { u, b ->
-                                        viewModel.updateSecondaryNavigationState(topTab.id, u, b)
-                                    },
-                                    onErrorChanged = { err -> viewModel.setSecondaryWebError(topTab.id, err) },
-                                    onSessionCookieCaptured = {},
-                                    onLogoutUrlVisited = {},
-                                    onSnapshotCaptured = viewModel::saveCachedPageSnapshot,
-                                    onOfflineCacheModeChanged = { cache ->
-                                        viewModel.setSecondaryShowingOfflineCache(topTab.id, cache)
-                                    },
-                                    onSelectCachedSnapshot = { snap ->
-                                        viewModel.openSecondaryCachedSnapshot(topTab.id, snap)
-                                    },
-                                    onShowCustomOfflineScreen = {
-                                        viewModel.showSecondaryCustomOfflineScreen(topTab.id)
-                                    },
-                                    onOpenAlerts = { viewModel.openAlertsTab() },
-                                    onManualRefresh = {
-                                        viewModel.reloadSecondaryWebPage(topTab.id, topTab.url)
-                                    },
-                                    isInnerScrolledProvider = { viewModel.isSecondaryInnerScrolled(topTab.id) },
-                                    useFullStoreHooks = false,
-                                    tagPrefix = topTab.id,
-                                    modifier = Modifier
-                                        .fillMaxSize()
-                                        .zIndex(if (tabVisible) 2f else 0f)
-                                )
-                            }
+                    if (!isStoreBound) {
+                        // Unbound clean launch: display default generic login portal only
+                        key("unbound_generic_portal") {
+                            PortalWebViewScreen(
+                                initialUrl = DEFAULT_GENERIC_PORTAL_URL,
+                                isVisible = true,
+                                isOnline = uiState.isOnline,
+                                pendingSyncCount = 0,
+                                pageProgress = uiState.pageProgress,
+                                canGoBack = uiState.canGoBack,
+                                webError = uiState.webError,
+                                isShowingOfflineCache = uiState.isShowingOfflineCache,
+                                cachedPages = uiState.cachedPages,
+                                offlinePageCache = viewModel.offlinePageCache,
+                                jsBridge = viewModel.jsBridge,
+                                commands = viewModel.webViewCommands,
+                                onProgressChanged = viewModel::updateWebProgress,
+                                onNavigationChanged = viewModel::updateWebNavigationState,
+                                onErrorChanged = viewModel::setWebError,
+                                onSessionCookieCaptured = {},
+                                onLogoutUrlVisited = {},
+                                onSnapshotCaptured = viewModel::saveCachedPageSnapshot,
+                                onOfflineCacheModeChanged = viewModel::setShowingOfflineCache,
+                                onSelectCachedSnapshot = viewModel::openCachedSnapshot,
+                                onShowCustomOfflineScreen = viewModel::showCustomOfflineScreen,
+                                onOpenAlerts = {},
+                                onManualRefresh = { viewModel.reloadCurrentWebPage() },
+                                isInnerScrolledProvider = { viewModel.isWebInnerScrolled },
+                                extraHeadersProvider = viewModel::buildWebViewHeaders,
+                                boundStoreRootUrl = "",
+                                boundLoginUrl = "",
+                                useFullStoreHooks = false,
+                                tagPrefix = "generic_portal",
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .zIndex(2f)
+                            )
                         }
+                    } else {
+                        // Bound primary workspace WebView — locked strictly to the bound store's login/portal URL
+                        key(primaryStoreTab.id, uiState.config.boundStoreUrl) {
+                            val primaryVisible = !showAlertsOverlay &&
+                                uiState.selectedWorkspaceId == primaryStoreTab.id
+                            PortalWebViewScreen(
+                                initialUrl = primaryStoreTab.url.ifBlank { uiState.config.baseUrl },
+                                isVisible = primaryVisible,
+                                isOnline = uiState.isOnline,
+                                pendingSyncCount = uiState.pendingSyncCount,
+                                pageProgress = uiState.pageProgress,
+                                canGoBack = uiState.canGoBack,
+                                webError = uiState.webError,
+                                isShowingOfflineCache = uiState.isShowingOfflineCache,
+                                cachedPages = uiState.cachedPages,
+                                offlinePageCache = viewModel.offlinePageCache,
+                                jsBridge = viewModel.jsBridge,
+                                commands = viewModel.webViewCommands,
+                                onProgressChanged = viewModel::updateWebProgress,
+                                onNavigationChanged = viewModel::updateWebNavigationState,
+                                onErrorChanged = viewModel::setWebError,
+                                onSessionCookieCaptured = viewModel::onSessionCookieCaptured,
+                                onLogoutUrlVisited = viewModel::onLogoutUrlVisited,
+                                onSnapshotCaptured = viewModel::saveCachedPageSnapshot,
+                                onOfflineCacheModeChanged = viewModel::setShowingOfflineCache,
+                                onSelectCachedSnapshot = viewModel::openCachedSnapshot,
+                                onShowCustomOfflineScreen = viewModel::showCustomOfflineScreen,
+                                onOpenAlerts = { viewModel.openAlertsTab() },
+                                onManualRefresh = {
+                                    viewModel.reloadCurrentWebPage()
+                                    viewModel.syncNow()
+                                },
+                                isInnerScrolledProvider = { viewModel.isWebInnerScrolled },
+                                extraHeadersProvider = viewModel::buildWebViewHeaders,
+                                boundStoreRootUrl = uiState.config.boundStoreUrl,
+                                boundLoginUrl = uiState.config.baseUrl,
+                                useFullStoreHooks = true,
+                                tagPrefix = primaryStoreTab.id,
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .zIndex(if (primaryVisible) 2f else 0f)
+                            )
+                        }
+
+                        // Dynamic secondary top workspaces (panel-configured tabs), kept alive once opened
+                        uiState.visibleTopTabs
+                            .filter { !it.isPrimaryStore && it.id in uiState.openedWorkspaceIds }
+                            .forEach { topTab ->
+                                key(topTab.id, uiState.config.boundStoreUrl) {
+                                    val tabVisible = !showAlertsOverlay && uiState.selectedWorkspaceId == topTab.id
+                                    val secState = uiState.secondaryWebStates[topTab.id]
+                                        ?: SecondaryWebState(workspaceId = topTab.id, currentUrl = topTab.url)
+
+                                    PortalWebViewScreen(
+                                        initialUrl = topTab.url,
+                                        isVisible = tabVisible,
+                                        isOnline = uiState.isOnline,
+                                        pendingSyncCount = uiState.pendingSyncCount,
+                                        pageProgress = secState.pageProgress,
+                                        canGoBack = secState.canGoBack,
+                                        webError = secState.webError,
+                                        isShowingOfflineCache = secState.isShowingOfflineCache,
+                                        cachedPages = uiState.cachedPages,
+                                        offlinePageCache = viewModel.offlinePageCache,
+                                        jsBridge = viewModel.getSecondaryBridge(topTab.id),
+                                        commands = viewModel.getSecondaryCommands(topTab.id),
+                                        onProgressChanged = { p -> viewModel.updateSecondaryProgress(topTab.id, p) },
+                                        onNavigationChanged = { u, b ->
+                                            viewModel.updateSecondaryNavigationState(topTab.id, u, b)
+                                        },
+                                        onErrorChanged = { err -> viewModel.setSecondaryWebError(topTab.id, err) },
+                                        onSessionCookieCaptured = {},
+                                        onLogoutUrlVisited = {},
+                                        onSnapshotCaptured = viewModel::saveCachedPageSnapshot,
+                                        onOfflineCacheModeChanged = { cache ->
+                                            viewModel.setSecondaryShowingOfflineCache(topTab.id, cache)
+                                        },
+                                        onSelectCachedSnapshot = { snap ->
+                                            viewModel.openSecondaryCachedSnapshot(topTab.id, snap)
+                                        },
+                                        onShowCustomOfflineScreen = {
+                                            viewModel.showSecondaryCustomOfflineScreen(topTab.id)
+                                        },
+                                        onOpenAlerts = { viewModel.openAlertsTab() },
+                                        onManualRefresh = {
+                                            viewModel.reloadSecondaryWebPage(topTab.id, topTab.url)
+                                        },
+                                        isInnerScrolledProvider = { viewModel.isSecondaryInnerScrolled(topTab.id) },
+                                        extraHeadersProvider = viewModel::buildWebViewHeaders,
+                                        useFullStoreHooks = false,
+                                        tagPrefix = topTab.id,
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .zIndex(if (tabVisible) 2f else 0f)
+                                    )
+                                }
+                            }
+                    }
 
                     if (showAlertsOverlay) {
                         Surface(
@@ -701,6 +847,15 @@ fun BanglaStoreApp(
             isSyncing = uiState.isSyncing,
             lastSyncTimeMillis = uiState.lastSyncTimeMillis,
             lastSyncStatus = uiState.lastSyncStatus,
+            onOpenQrScanner = {
+                showSettingsSheet = false
+                viewModel.clearShopBindingError()
+                showQrScannerDialog = true
+            },
+            onUnlinkStore = {
+                showSettingsSheet = false
+                viewModel.resetShopBinding(onReadyToReboot = onRebootApp)
+            },
             onRequestNotificationPermission = {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                     notificationOnlyLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
@@ -735,11 +890,69 @@ fun BanglaStoreApp(
             onBindShopUrl = { url ->
                 viewModel.bindShopUrl(url, onReadyToReboot = onRebootApp)
             },
+            onOpenQrScanner = {
+                showShopBindingSheet = false
+                viewModel.clearShopBindingError()
+                showQrScannerDialog = true
+            },
             onResetToDefaultStore = {
                 viewModel.resetShopBinding(onReadyToReboot = onRebootApp)
             },
             onClearError = viewModel::clearShopBindingError,
             onDismiss = { showShopBindingSheet = false }
+        )
+    }
+
+    if (showQrScannerDialog) {
+        QrCodeScannerDialog(
+            bindingState = shopBindingState,
+            onQrCodeScanned = { rawQr ->
+                viewModel.bindShopFromQrPayload(rawQr, onReadyToReboot = onRebootApp)
+            },
+            onClearError = viewModel::clearShopBindingError,
+            onDismiss = {
+                showQrScannerDialog = false
+                viewModel.clearShopBindingError()
+            }
+        )
+    }
+
+    if (showQuickUnlinkDialog && isStoreBound) {
+        AlertDialog(
+            onDismissRequest = { showQuickUnlinkDialog = false },
+            icon = {
+                Icon(
+                    imageVector = Icons.Rounded.LinkOff,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.error
+                )
+            },
+            title = { Text("শপ আনলিংক করবেন?") },
+            text = {
+                Text(
+                    "\"${uiState.config.effectiveStoreDisplayName}\" থেকে আনলিংক করলে বর্তমান সেশন, ব্যাকগ্রাউন্ড GPS ও শপের সব কনফিগ মুছে গিয়ে অ্যাপটি রিবুট হবে।"
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showQuickUnlinkDialog = false
+                        viewModel.resetShopBinding(onReadyToReboot = onRebootApp)
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error,
+                        contentColor = MaterialTheme.colorScheme.onError
+                    ),
+                    modifier = Modifier.testTag("quick_confirm_unlink_button")
+                ) {
+                    Text("আনলিংক ও রিবুট করুন")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showQuickUnlinkDialog = false }) {
+                    Text("বাতিল")
+                }
+            }
         )
     }
 }

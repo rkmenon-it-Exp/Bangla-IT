@@ -20,6 +20,7 @@ import com.example.model.AlertDeliveryMode
 import com.example.model.AlertFilter
 import com.example.model.AppTab
 import com.example.model.AppWorkspace
+import com.example.model.DEFAULT_GENERIC_PORTAL_URL
 import com.example.model.GpsCollectionMode
 import com.example.model.GpsUploadTrigger
 import com.example.model.LocationSnapshot
@@ -34,6 +35,7 @@ import com.example.model.defaultBottomTabs
 import com.example.model.defaultTopTabs
 import com.example.notifications.NotificationHelper
 import com.example.sync.AppUpdateChecker
+import com.example.sync.DeviceTelemetryHelper
 import com.example.sync.ImmediateSyncWorker
 import com.example.sync.NetworkMonitor
 import com.example.sync.NotificationPoller
@@ -77,10 +79,11 @@ data class SecondaryWebState(
 )
 
 data class BanglaStoreUiState(
+    val isConfigLoaded: Boolean = false,
     val selectedWorkspaceId: String = AppWorkspace.BANGLA_STORE.id,
     val openedWorkspaceIds: Set<String> = setOf(AppWorkspace.BANGLA_STORE.id),
-    val visibleTopTabs: List<RemoteTopTab> = defaultTopTabs(),
-    val visibleBottomTabs: List<RemoteBottomTab> = defaultBottomTabs(),
+    val visibleTopTabs: List<RemoteTopTab> = emptyList(),
+    val visibleBottomTabs: List<RemoteBottomTab> = emptyList(),
     val selectedBottomTabId: String = AppTab.PORTAL.route,
     val config: PortalConfig = PortalConfig(),
     val notifications: List<StoreNotification> = emptyList(),
@@ -109,16 +112,26 @@ data class BanglaStoreUiState(
     val activeWorkspaceTab: RemoteTopTab
         get() = visibleTopTabs.firstOrNull { it.id == selectedWorkspaceId }
             ?: visibleTopTabs.firstOrNull()
-            ?: defaultTopTabs().first()
+            ?: defaultTopTabs(
+                primaryUrl = config.baseUrl,
+                primaryLabel = config.effectiveStoreDisplayName,
+                includeDefaultIsp = false
+            ).first()
 
     val primaryStoreTab: RemoteTopTab
         get() = visibleTopTabs.firstOrNull { it.isPrimaryStore }
             ?: visibleTopTabs.firstOrNull()
-            ?: defaultTopTabs().first()
+            ?: defaultTopTabs(
+                primaryUrl = config.baseUrl,
+                primaryLabel = config.effectiveStoreDisplayName,
+                includeDefaultIsp = false
+            ).first()
 
     val isAlertsOverlayVisible: Boolean
-        get() = visibleBottomTabs.firstOrNull { it.id == selectedBottomTabId }?.type == "alerts" ||
-            selectedBottomTabId == AppTab.ALERTS.route
+        get() = config.isCustomStoreBound && (
+            visibleBottomTabs.firstOrNull { it.id == selectedBottomTabId }?.type == "alerts" ||
+                selectedBottomTabId == AppTab.ALERTS.route
+            )
 }
 
 class BanglaStoreViewModel(application: Application) : AndroidViewModel(application) {
@@ -257,20 +270,43 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         val isDeviceGps = values[12] as Boolean
         val showBgDialog = values[13] as Boolean
 
+        val isBound = config.isCustomStoreBound
         val roleKey = config.userRole.key.lowercase()
-        val visibleTop = config.remoteControl.topTabs
-            .filter { tab ->
-                tab.enabled && (tab.roles.isEmpty() || "all" in tab.roles || roleKey in tab.roles)
-            }
-            .ifEmpty { defaultTopTabs() }
 
-        val visibleBottom = config.remoteControl.bottomTabs
-            .filter { tab ->
-                tab.enabled && (tab.roles.isEmpty() || "all" in tab.roles || roleKey in tab.roles)
-            }
-            .ifEmpty { defaultBottomTabs() }
+        val visibleTop = if (!isBound) {
+            emptyList()
+        } else {
+            config.remoteControl.topTabs
+                .filter { tab ->
+                    tab.enabled && (tab.roles.isEmpty() || "all" in tab.roles || roleKey in tab.roles)
+                }
+                .ifEmpty {
+                    defaultTopTabs(
+                        primaryUrl = config.baseUrl,
+                        primaryLabel = config.effectiveStoreDisplayName,
+                        includeDefaultIsp = false
+                    )
+                }
+        }
 
-        val primaryId = (visibleTop.firstOrNull { it.isPrimaryStore } ?: visibleTop.first()).id
+        val visibleBottom = if (!isBound) {
+            emptyList()
+        } else {
+            config.remoteControl.bottomTabs
+                .filter { tab ->
+                    tab.enabled && (tab.roles.isEmpty() || "all" in tab.roles || roleKey in tab.roles)
+                }
+                .ifEmpty {
+                    defaultBottomTabs(
+                        baseUrl = config.baseUrl,
+                        attendanceUrl = config.attendanceUrl,
+                        tasksUrl = config.tasksUrl
+                    )
+                }
+        }
+
+        val primaryId = (visibleTop.firstOrNull { it.isPrimaryStore } ?: visibleTop.firstOrNull())?.id
+            ?: AppWorkspace.BANGLA_STORE.id
         val effectiveWorkspaceId = if (visibleTop.any { it.id == webAgg.selectedWorkspaceId }) {
             webAgg.selectedWorkspaceId
         } else {
@@ -281,7 +317,7 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         val effectiveBottomTabId = if (visibleBottom.any { it.id == webAgg.selectedBottomTabId }) {
             webAgg.selectedBottomTabId
         } else {
-            visibleBottom.first().id
+            visibleBottom.firstOrNull()?.id ?: AppTab.PORTAL.route
         }
 
         val filtered = when (filter) {
@@ -295,7 +331,10 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
             }
         }
 
+        val fallbackUrl = if (isBound) config.baseUrl else DEFAULT_GENERIC_PORTAL_URL
+
         BanglaStoreUiState(
+            isConfigLoaded = true,
             selectedWorkspaceId = effectiveWorkspaceId,
             openedWorkspaceIds = effectiveOpened,
             visibleTopTabs = visibleTop,
@@ -307,7 +346,7 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
             alertFilter = filter,
             unreadCount = allNotifications.count { !it.isRead },
             pageProgress = webAgg.pageProgress,
-            currentUrl = webAgg.currentUrl.ifBlank { config.baseUrl },
+            currentUrl = webAgg.currentUrl.ifBlank { fallbackUrl },
             canGoBack = webAgg.canGoBack,
             webError = webAgg.webError,
             secondaryWebStates = webAgg.secondaryStates,
@@ -328,13 +367,14 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
     }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(5000),
-        initialValue = BanglaStoreUiState()
+        initialValue = BanglaStoreUiState(isConfigLoaded = false)
     )
 
     val jsBridge: BanglaStoreBridge = BanglaStoreBridge(
         onSessionDetectedCallback = { role, userId, userName, panelId ->
             viewModelScope.launch {
                 val prev = repository.getConfigSnapshot()
+                if (!prev.isCustomStoreBound) return@launch
                 repository.updateSessionFromWeb(role, userId, userName, panelId)
                 val updated = repository.getConfigSnapshot()
                 if (updated.panelId != prev.panelId ||
@@ -347,6 +387,8 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         },
         onLoginSubmittedCallback = { userId ->
             viewModelScope.launch {
+                val cfg = repository.getConfigSnapshot()
+                if (!cfg.isCustomStoreBound) return@launch
                 pendingPostLoginRedirect = true
                 if (userId.isNotBlank()) {
                     repository.markLoggedInUserId(userId)
@@ -355,6 +397,8 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         },
         onLogoutDetectedCallback = {
             viewModelScope.launch {
+                val cfg = repository.getConfigSnapshot()
+                if (!cfg.isCustomStoreBound) return@launch
                 sawLoginPage = true
                 pendingPostLoginRedirect = false
                 repository.clearLoginSession()
@@ -368,6 +412,7 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         onIncomingEventCallback = { rawNotif, shouldAutoRefresh ->
             viewModelScope.launch {
                 val config = repository.getConfigSnapshot()
+                if (!config.isCustomStoreBound) return@launch
                 val remoteControl = config.remoteControl
                 if (remoteControl.allowedEventTypes.isNotEmpty() &&
                     rawNotif.type.key.lowercase() !in remoteControl.allowedEventTypes
@@ -418,6 +463,8 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         },
         onGpsRequestedCallback = { requestId ->
             viewModelScope.launch {
+                val config = repository.getConfigSnapshot()
+                if (!config.isCustomStoreBound) return@launch
                 val snap = gpsCapturer.captureAndUploadIfAllowed(
                     trigger = GpsUploadTrigger.PANEL_REQUEST,
                     requestId = requestId,
@@ -432,18 +479,35 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
             isWebInnerScrolled = scrolled
         },
         locationSnapshotProvider = { uiState.value.locationSnapshot },
-        deviceInfoProvider = { buildDeviceInfoJson() }
+        deviceInfoProvider = { buildDeviceInfoJson() },
+        deviceIdProvider = { currentDeviceId() },
+        deviceModelProvider = { DeviceTelemetryHelper.getDeviceModel() },
+        batteryLevelProvider = { DeviceTelemetryHelper.getBatteryLevel(getApplication()) }
     )
 
+    private fun currentDeviceId(): String {
+        val ctx = getApplication<Application>()
+        return cachedUniqueDeviceId.ifBlank { DeviceTelemetryHelper.getDeviceId(ctx) }
+    }
+
+    fun buildWebViewHeaders(): Map<String, String> {
+        return DeviceTelemetryHelper.buildRequestHeaders(getApplication(), currentDeviceId())
+    }
+
     private fun buildDeviceInfoJson(): String {
+        val ctx = getApplication<Application>()
         val cfg = uiState.value.config
+        val deviceId = currentDeviceId()
         return JSONObject().apply {
-            put("unique_device_id", cachedUniqueDeviceId)
-            put("device_model", Build.MODEL.orEmpty())
-            put("os_version", "Android ${Build.VERSION.RELEASE.orEmpty()}")
-            put("app_version", BuildConfig.VERSION_NAME)
+            put("device_id", deviceId)
+            put("unique_device_id", deviceId)
+            put("device_model", DeviceTelemetryHelper.getDeviceModel())
+            put("os_version", DeviceTelemetryHelper.getOsVersion())
+            put("app_version", DeviceTelemetryHelper.getAppVersion())
+            put("battery_level", DeviceTelemetryHelper.getBatteryLevel(ctx))
             put("store_code", cfg.storeCode)
             put("panel_id", cfg.panelId)
+            put("is_bound", cfg.isCustomStoreBound)
         }.toString()
     }
 
@@ -478,7 +542,11 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
                 onInnerScrollChangedCallback = { scrolled ->
                     secondaryInnerScrolledMap[workspaceId] = scrolled
                 },
-                locationSnapshotProvider = { uiState.value.locationSnapshot }
+                locationSnapshotProvider = { uiState.value.locationSnapshot },
+                deviceInfoProvider = { buildDeviceInfoJson() },
+                deviceIdProvider = { currentDeviceId() },
+                deviceModelProvider = { DeviceTelemetryHelper.getDeviceModel() },
+                batteryLevelProvider = { DeviceTelemetryHelper.getBatteryLevel(getApplication()) }
             )
         }
     }
@@ -488,7 +556,9 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     private suspend fun handleWebPageReady(url: String, hasLoginForm: Boolean) {
-        if (_isShowingOfflineCache.value ||
+        val initialCfg = repository.getConfigSnapshot()
+        if (!initialCfg.isCustomStoreBound ||
+            _isShowingOfflineCache.value ||
             url.isBlank() ||
             url.startsWith("data:", ignoreCase = true) ||
             !url.startsWith("http", ignoreCase = true)
@@ -523,13 +593,14 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
             val savedPrevUrl = config.previousUrl.takeIf {
                 it.startsWith("https://", ignoreCase = true) &&
                     !isLoginUrl(it) &&
-                    !isLogoutUrl(it)
+                    !isLogoutUrl(it) &&
+                    !RemoteConfigSyncer.isGlobalPortalUrlForBoundStore(it, config.boundStoreUrl)
             }
             val targetUrl = savedPrevUrl ?: tabDefaultUrl
 
             val isPortalHomeAlreadyOpen = targetBottomId == AppTab.PORTAL.route &&
                 urlsEffectivelyEqual(targetUrl, config.baseUrl) &&
-                url.startsWith(config.baseUrl, ignoreCase = true)
+                url.startsWith(config.boundStoreUrl, ignoreCase = true)
 
             if (!isPortalHomeAlreadyOpen &&
                 (targetBottomId != _selectedBottomTabId.value || !urlsEffectivelyEqual(url, targetUrl))
@@ -547,12 +618,14 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         }
 
         // Record current authenticated web tab & URL as the previous tab for future logins
-        val activeId = if (!uiState.value.isAlertsOverlayVisible) {
-            _selectedBottomTabId.value
-        } else {
-            lastWebBottomTabId
+        if (!RemoteConfigSyncer.isGlobalPortalUrlForBoundStore(url, initialCfg.boundStoreUrl)) {
+            val activeId = if (!uiState.value.isAlertsOverlayVisible) {
+                _selectedBottomTabId.value
+            } else {
+                lastWebBottomTabId
+            }
+            repository.savePreviousTabLocation(activeId, AppTab.fromRoute(activeId), url)
         }
-        repository.savePreviousTabLocation(activeId, AppTab.fromRoute(activeId), url)
     }
 
     private fun defaultUrlForTab(tab: AppTab, config: PortalConfig): String {
@@ -596,6 +669,15 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         }
         viewModelScope.launch {
             cachedUniqueDeviceId = repository.getOrCreateUniqueDeviceId()
+            val initialConfig = repository.getConfigSnapshot()
+            if (!initialConfig.isCustomStoreBound) {
+                // Clean unbound launch: stop all background services/workers and do not contact any store
+                LocationPermissionHelper.stopTrackingService(getApplication())
+                NotificationSyncWorker.schedulePeriodicSync(getApplication(), enabled = false)
+                LocationSyncWorker.schedulePeriodicLocationSync(getApplication(), enabled = false)
+                return@launch
+            }
+
             if (LocationPermissionHelper.hasForegroundLocationPermission(application)) {
                 repository.ensureAndGetGpsScheduleAnchorTime()
             }
@@ -603,7 +685,7 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
             val config = repository.getConfigSnapshot()
             NotificationSyncWorker.schedulePeriodicSync(
                 getApplication(),
-                config.backgroundSyncEnabled && config.remoteControl.backgroundSyncEnabled
+                config.isCustomStoreBound && config.backgroundSyncEnabled && config.remoteControl.backgroundSyncEnabled
             )
             syncGpsWorkersAndService(config)
             // Arm reconnect worker if there are already queued items or currently offline
@@ -620,7 +702,8 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
     private fun syncGpsWorkersAndService(config: PortalConfig) {
         val ctx = getApplication<Application>()
         val fgGranted = LocationPermissionHelper.hasForegroundLocationPermission(ctx)
-        val gpsAllowed = config.gpsTrackingEnabled &&
+        val gpsAllowed = config.isCustomStoreBound &&
+            config.gpsTrackingEnabled &&
             config.remoteControl.gpsEnabled &&
             config.remoteControl.gpsMode != GpsCollectionMode.OFF &&
             fgGranted
@@ -656,11 +739,34 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         viewModelScope.launch {
             networkMonitor.isOnline
                 .collect { online ->
+                    val currentCfg = repository.getConfigSnapshot()
                     if (!online) {
                         wasOnline = false
-                        ImmediateSyncWorker.scheduleOnReconnect(getApplication())
+                        if (currentCfg.isCustomStoreBound) {
+                            ImmediateSyncWorker.scheduleOnReconnect(getApplication())
+                        }
                     } else if (!wasOnline) {
                         wasOnline = true
+                        val hadOfflineUi = _webError.value != null || _isShowingOfflineCache.value
+                        _webError.value = null
+                        _isShowingOfflineCache.value = false
+                        if (hadOfflineUi) {
+                            _webViewCommands.tryEmit(WebViewCommand.Reload)
+                        }
+                        _secondaryWebStates.value.forEach { (wsId, state) ->
+                            if (state.webError != null || state.isShowingOfflineCache) {
+                                updateSecondaryState(wsId) {
+                                    it.copy(webError = null, isShowingOfflineCache = false)
+                                }
+                                getOrCreateSecondaryCommandFlow(wsId).tryEmit(WebViewCommand.Reload)
+                            }
+                        }
+
+                        if (!currentCfg.isCustomStoreBound) {
+                            _snackbarMessages.tryEmit("ইন্টারনেট সংযোগ ফিরে এসেছে")
+                            return@collect
+                        }
+
                         remoteConfigSyncer.syncConfig()
                         val latestCfg = repository.getConfigSnapshot()
                         val intervalMs = latestCfg.remoteControl.gpsIntervalSeconds.coerceAtLeast(3600) * 1000L
@@ -677,20 +783,6 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
                             if (sent != null) flushed = 1
                         }
 
-                        val hadOfflineUi = _webError.value != null || _isShowingOfflineCache.value
-                        _webError.value = null
-                        _isShowingOfflineCache.value = false
-                        if (hadOfflineUi) {
-                            _webViewCommands.tryEmit(WebViewCommand.Reload)
-                        }
-                        _secondaryWebStates.value.forEach { (wsId, state) ->
-                            if (state.webError != null || state.isShowingOfflineCache) {
-                                updateSecondaryState(wsId) {
-                                    it.copy(webError = null, isShowingOfflineCache = false)
-                                }
-                                getOrCreateSecondaryCommandFlow(wsId).tryEmit(WebViewCommand.Reload)
-                            }
-                        }
                         runPollCycle(showSnackbarOnError = false)
                         _snackbarMessages.tryEmit(
                             if (flushed > 0) {
@@ -708,7 +800,9 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         viewModelScope.launch {
             while (isActive) {
                 val config = repository.getConfigSnapshot()
-                val effectiveSync = config.backgroundSyncEnabled && config.remoteControl.backgroundSyncEnabled
+                val effectiveSync = config.isCustomStoreBound &&
+                    config.backgroundSyncEnabled &&
+                    config.remoteControl.backgroundSyncEnabled
                 if (effectiveSync && networkMonitor.isOnline.value) {
                     remoteConfigSyncer.syncConfig()
                     val latestCfg = repository.getConfigSnapshot()
@@ -750,10 +844,14 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         _isDeviceGpsEnabled.value = gpsHardwareOn
 
         viewModelScope.launch {
+            val config = repository.getConfigSnapshot()
+            if (!config.isCustomStoreBound) {
+                syncGpsWorkersAndService(config)
+                return@launch
+            }
             if (fgLocGranted) {
                 repository.ensureAndGetGpsScheduleAnchorTime()
             }
-            val config = repository.getConfigSnapshot()
             syncGpsWorkersAndService(config)
             if (fgLocGranted &&
                 config.gpsTrackingEnabled &&
@@ -874,6 +972,10 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     fun reloadActiveWorkspace() {
+        if (!uiState.value.config.isCustomStoreBound) {
+            reloadCurrentWebPage()
+            return
+        }
         val active = uiState.value.activeWorkspaceTab
         if (active.isPrimaryStore) {
             reloadCurrentWebPage()
@@ -884,6 +986,10 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     fun navigateActiveWebBack() {
+        if (!uiState.value.config.isCustomStoreBound) {
+            navigateWebBack()
+            return
+        }
         val active = uiState.value.activeWorkspaceTab
         if (active.isPrimaryStore) {
             navigateWebBack()
@@ -896,7 +1002,12 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         networkMonitor.refreshNow()
         _webError.value = null
         _isShowingOfflineCache.value = false
-        val target = _currentUrl.value.ifBlank { uiState.value.config.baseUrl }
+        val fallback = if (uiState.value.config.isCustomStoreBound) {
+            uiState.value.config.baseUrl
+        } else {
+            DEFAULT_GENERIC_PORTAL_URL
+        }
+        val target = _currentUrl.value.ifBlank { fallback }
         if (target.startsWith("http", ignoreCase = true)) {
             _webViewCommands.tryEmit(WebViewCommand.LoadUrl(target))
         } else {
@@ -1031,6 +1142,11 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
 
     fun syncNow() {
         viewModelScope.launch {
+            val currentCfg = repository.getConfigSnapshot()
+            if (!currentCfg.isCustomStoreBound) {
+                _snackbarMessages.tryEmit("প্রথমে একটি শপ কানেক্ট (বাইন্ড) করুন")
+                return@launch
+            }
             val online = networkMonitor.refreshNow()
             val ctx = getApplication<Application>()
             if (!online) {
@@ -1195,6 +1311,19 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         _shopBindingState.update { it.copy(errorMessage = null, statusMessage = null) }
     }
 
+    fun bindShopFromQrPayload(rawQr: String, onReadyToReboot: () -> Unit) {
+        if (_shopBindingState.value.isLoading) return
+        val extractedUrl = ShopHandshakeManager.extractStoreUrlFromQr(rawQr)
+        if (extractedUrl.isNullOrBlank()) {
+            _shopBindingState.value = ShopBindingUiState(
+                isLoading = false,
+                errorMessage = "এই QR কোডে সঠিক শপের URL পাওয়া যায়নি। অ্যাডমিন প্যানেলের স্টোর QR কোড স্ক্যান করুন।"
+            )
+            return
+        }
+        bindShopUrl(extractedUrl, onReadyToReboot)
+    }
+
     fun bindShopUrl(rawUrl: String, onReadyToReboot: () -> Unit) {
         if (_shopBindingState.value.isLoading) return
         viewModelScope.launch {
@@ -1254,8 +1383,12 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         viewModelScope.launch {
             _shopBindingState.value = ShopBindingUiState(
                 isLoading = true,
-                statusMessage = "ডিফল্ট বাংলা স্টোর রিসেট ও রিবুট হচ্ছে..."
+                statusMessage = "শপ আনলিংক ও অ্যাপ রিবুট হচ্ছে..."
             )
+            val ctx = getApplication<Application>()
+            LocationPermissionHelper.stopTrackingService(ctx)
+            NotificationSyncWorker.schedulePeriodicSync(ctx, enabled = false)
+            LocationSyncWorker.schedulePeriodicLocationSync(ctx, enabled = false)
             runCatching {
                 val cm = CookieManager.getInstance()
                 cm.removeAllCookies(null)

@@ -193,13 +193,14 @@ data class ShopBindingUiState(
 )
 
 data class PortalConfig(
-    val baseUrl: String = DEFAULT_BASE_URL,
-    val attendanceUrl: String = DEFAULT_ATTENDANCE_URL,
-    val tasksUrl: String = DEFAULT_TASKS_URL,
-    val notificationApiUrl: String = DEFAULT_NOTIFICATION_API_URL,
-    val locationApiUrl: String = DEFAULT_LOCATION_API_URL,
-    val syncGpsApiUrl: String = DEFAULT_SYNC_GPS_API_URL,
-    val configApiUrl: String = DEFAULT_CONFIG_API_URL,
+    val isBound: Boolean = false,
+    val baseUrl: String = DEFAULT_GENERIC_PORTAL_URL,
+    val attendanceUrl: String = "",
+    val tasksUrl: String = "",
+    val notificationApiUrl: String = "",
+    val locationApiUrl: String = "",
+    val syncGpsApiUrl: String = "",
+    val configApiUrl: String = "",
     val boundStoreUrl: String = "",
     val storeCode: String = "",
     val storeName: String = "",
@@ -220,7 +221,7 @@ data class PortalConfig(
     val remoteControl: RemoteControlSettings = RemoteControlSettings()
 ) {
     val isCustomStoreBound: Boolean
-        get() = boundStoreUrl.isNotBlank()
+        get() = isBound && boundStoreUrl.isNotBlank()
 
     val effectiveStoreDisplayName: String
         get() = appTitle.ifBlank { storeName.ifBlank { remoteControl.panelName.ifBlank { "বাংলা স্টোর" } } }
@@ -337,6 +338,7 @@ fun defaultBottomTabs(
     )
 )
 
+const val DEFAULT_GENERIC_PORTAL_URL = "https://banglait.net/shop/"
 const val DEFAULT_BASE_URL = "https://banglait.net/shop"
 const val DEFAULT_ATTENDANCE_URL = "https://banglait.net/shop/dashboard.php?staff_view=attendance"
 const val DEFAULT_TASKS_URL = "https://banglait.net/shop/tasks.php"

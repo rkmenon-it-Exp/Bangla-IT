@@ -13,6 +13,10 @@
     <string name="cd_shop_binding_logo">Open shop binding settings</string>
     <string name="cd_refresh_page">Refresh current page</string>
     <string name="cd_notifications">Open notifications</string>
-    <string name="cd_settings">Open notification settings</string>
+    <string name="cd_settings">Open admin settings</string>
     <string name="cd_banner_illustration">Store attendance and task notification illustration</string>
+    <string name="cd_scan_qr_code">Scan store binding QR code</string>
+    <string name="cd_toggle_flash">Toggle camera flashlight</string>
+    <string name="cd_close_scanner">Close QR code scanner</string>
+    <string name="cd_toggle_password_visibility">Toggle password visibility</string>
 </resources>

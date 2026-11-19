@@ -41,6 +41,14 @@ class NotificationPoller(
 
     suspend fun pollOnce(showSystemNotifications: Boolean = true): PollSyncResult = withContext(Dispatchers.IO) {
         val config = repository.getConfigSnapshot()
+        if (!config.isCustomStoreBound || config.notificationApiUrl.isBlank()) {
+            return@withContext PollSyncResult(
+                success = false,
+                newNotificationsCount = 0,
+                shouldAutoRefreshTasks = false,
+                statusMessage = "কোনো শপ বাইন্ড করা নেই"
+            )
+        }
         val lastVersion = repository.getLastTaskVersion()
         val lastSyncMillis = repository.getLastSyncTimeMillis()
         val deviceId = repository.getOrCreateUniqueDeviceId()
@@ -53,10 +61,9 @@ class NotificationPoller(
         val requestBuilder = Request.Builder()
             .url(requestUrl)
             .header("Accept", "application/json")
-            .header("X-Device-Id", deviceId)
-            .header("X-Device-Model", Build.MODEL.orEmpty())
-            .header("X-OS-Version", "Android ${Build.VERSION.RELEASE.orEmpty()}")
-            .header("X-App-Version", BuildConfig.VERSION_NAME)
+        DeviceTelemetryHelper.buildRequestHeaders(context, deviceId).forEach { (k, v) ->
+            requestBuilder.header(k, v)
+        }
         if (cookie.isNotBlank()) {
             requestBuilder.header("Cookie", cookie)
         }
@@ -124,6 +131,7 @@ class NotificationPoller(
                 }
 
                 // If server bundles inline app_config inside notifications.php, apply it immediately
+                val boundRoot = config.boundStoreUrl.trim().trimEnd('/')
                 val bundledConfig = if (rootObj.has("app_config") || rootObj.has("config")) {
                     RemoteConfigSyncer.parseRemoteControlSettings(
                         sourceObj = rootObj,
@@ -131,16 +139,31 @@ class NotificationPoller(
                         fallbackAttendanceUrl = config.attendanceUrl,
                         fallbackTasksUrl = config.tasksUrl,
                         fallbackPrimaryLabel = config.effectiveStoreDisplayName,
-                        includeDefaultIsp = !config.isCustomStoreBound
+                        includeDefaultIsp = !config.isCustomStoreBound,
+                        boundStoreRootUrl = boundRoot
                     )
                 } else {
                     null
                 }
                 if (bundledConfig != null) {
+                    val rawOverrides = RemoteConfigSyncer.extractUrlOverrides(
+                        rootObj,
+                        boundRoot.ifBlank { config.baseUrl }
+                    )
+                    val safeOverrides = rawOverrides.filter { (k, v) ->
+                        if (k == "base_url" && boundRoot.isNotBlank()) {
+                            !RemoteConfigSyncer.isGlobalPortalUrlForBoundStore(v, boundRoot)
+                        } else {
+                            true
+                        }
+                    }
                     repository.saveRemoteControl(
                         bundledConfig,
-                        RemoteConfigSyncer.extractUrlOverrides(rootObj, config.baseUrl),
-                        RemoteConfigSyncer.extractBrandingUpdate(rootObj, config.baseUrl)
+                        safeOverrides,
+                        RemoteConfigSyncer.extractBrandingUpdate(
+                            rootObj,
+                            boundRoot.ifBlank { config.baseUrl }
+                        )
                     )
                 }
                 val latestConfig = if (bundledConfig != null) {

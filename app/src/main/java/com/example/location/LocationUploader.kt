@@ -12,6 +12,7 @@ import com.example.data.StorePreferencesRepository
 import com.example.model.GpsCollectionMode
 import com.example.model.GpsUploadTrigger
 import com.example.model.LocationSnapshot
+import com.example.sync.DeviceTelemetryHelper
 import com.example.sync.ImmediateSyncWorker
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
@@ -44,6 +45,9 @@ class LocationUploader(
         trigger: GpsUploadTrigger = GpsUploadTrigger.HOURLY_SCHEDULE
     ): LocationSnapshot = withContext(Dispatchers.IO) {
         val config = repository.getConfigSnapshot()
+        if (!config.isCustomStoreBound || config.locationApiUrl.isBlank()) {
+            return@withContext repository.getLatestLocationSnapshot()
+        }
         val deviceId = repository.getOrCreateUniqueDeviceId()
         val now = if (location.time > 0L) location.time else System.currentTimeMillis()
         val payload = buildPayload(
@@ -83,7 +87,9 @@ class LocationUploader(
     ): LocationSnapshot = withContext(Dispatchers.IO) {
         val config = repository.getConfigSnapshot()
         val remote = config.remoteControl
-        if (!config.gpsTrackingEnabled ||
+        if (!config.isCustomStoreBound ||
+            config.locationApiUrl.isBlank() ||
+            !config.gpsTrackingEnabled ||
             !remote.gpsEnabled ||
             remote.gpsMode == GpsCollectionMode.OFF
         ) {
@@ -156,6 +162,9 @@ class LocationUploader(
             if (pending.isEmpty()) return@withLock 0
 
             val config = repository.getConfigSnapshot()
+            if (!config.isCustomStoreBound || config.locationApiUrl.isBlank()) {
+                return@withLock 0
+            }
             val deviceId = repository.getOrCreateUniqueDeviceId()
             val cookie = resolveEffectiveCookie(config.baseUrl)
             val remaining = mutableListOf<JSONObject>()
@@ -315,13 +324,10 @@ class LocationUploader(
             val requestBuilder = Request.Builder()
                 .url(url)
                 .header("Accept", "application/json")
-                .header("X-Device-Model", Build.MODEL.orEmpty())
-                .header("X-OS-Version", "Android ${Build.VERSION.RELEASE.orEmpty()}")
-                .header("X-App-Version", BuildConfig.VERSION_NAME)
                 .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
 
-            if (deviceId.isNotBlank()) {
-                requestBuilder.header("X-Device-Id", deviceId)
+            DeviceTelemetryHelper.buildRequestHeaders(context, deviceId).forEach { (k, v) ->
+                requestBuilder.header(k, v)
             }
             if (cookie.isNotBlank()) {
                 requestBuilder.header("Cookie", cookie)

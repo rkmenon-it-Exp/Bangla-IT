@@ -10,8 +10,10 @@ import com.example.model.defaultBottomTabs
 import com.example.model.defaultTopTabs
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.io.IOException
 import java.net.SocketTimeoutException
@@ -62,10 +64,16 @@ class ShopHandshakeManager(
 
         val deviceId = repository.getOrCreateUniqueDeviceId()
         val handshakeUrl = "$normalizedBase/api/app_handshake.php"
+        val altHandshakeUrl = "$normalizedBase/api/api_handshake.php"
         val configUrl = "$normalizedBase/api/app_config.php"
 
-        // 1. Try primary Antigravity endpoint: {store_url}/api/app_handshake.php
-        val handshakeFetch = fetchJsonObject(handshakeUrl, deviceId)
+        // 1. Try primary endpoint: {store_url}/api/app_handshake.php
+        //    Fallback 1: {store_url}/api/api_handshake.php
+        //    Fallback 2: {store_url}/api/app_config.php
+        var handshakeFetch = fetchJsonObject(handshakeUrl, deviceId)
+        if (handshakeFetch is FetchOutcome.NotFound) {
+            handshakeFetch = fetchJsonObject(altHandshakeUrl, deviceId)
+        }
         val primaryObj: JSONObject = when (handshakeFetch) {
             is FetchOutcome.Ok -> {
                 if (handshakeFetch.json.has("success") && !handshakeFetch.json.optBoolean("success", true)) {
@@ -79,11 +87,10 @@ class ShopHandshakeManager(
                 handshakeFetch.json
             }
             is FetchOutcome.NotFound -> {
-                // Graceful fallback: try {store_url}/api/app_config.php directly
                 when (val cfgFallback = fetchJsonObject(configUrl, deviceId)) {
                     is FetchOutcome.Ok -> cfgFallback.json
                     is FetchOutcome.NotFound -> return@withContext ShopHandshakeResult.Failure(
-                        "এই URL-এ শপ API (app_handshake.php / app_config.php) পাওয়া যায়নি (404)। URL টি যাচাই করুন।"
+                        "এই URL-এ শপ API (app_handshake.php / api_handshake.php / app_config.php) পাওয়া যায়নি (404)। URL টি যাচাই করুন।"
                     )
                     is FetchOutcome.Error -> return@withContext ShopHandshakeResult.Failure(cfgFallback.messageBn)
                 }
@@ -139,19 +146,46 @@ class ShopHandshakeManager(
             .ifBlank { extraConfigObj?.optString("panel_id").orEmpty().trim() }
             .ifBlank { storeCode }
 
-        val resolvedBaseUrl = urlOverrides["base_url"] ?: normalizedBase
+        val effectiveStoreRoot = if (storeCode.isNotBlank() &&
+            !normalizedBase.endsWith("/$storeCode", ignoreCase = true) &&
+            normalizedBase.trimEnd('/').endsWith("/shop", ignoreCase = true)
+        ) {
+            "${normalizedBase.trimEnd('/')}/$storeCode"
+        } else {
+            normalizedBase
+        }
+
+        val defaultBoundLoginUrl = "$effectiveStoreRoot/login"
+        val explicitLoginUrl = primaryObj.optString("login_url").trim()
+            .ifBlank { extraConfigObj?.optString("login_url").orEmpty().trim() }
+            .takeIf { it.isNotBlank() }
+            ?.let { RemoteConfigSyncer.resolveUrlAgainstBase(it, effectiveStoreRoot) }
+            ?.takeUnless { RemoteConfigSyncer.isGlobalPortalUrlForBoundStore(it, effectiveStoreRoot) }
+
+        val candidateBaseOverride = urlOverrides["base_url"]
+            ?.takeUnless { RemoteConfigSyncer.isGlobalPortalUrlForBoundStore(it, effectiveStoreRoot) }
+
+        val resolvedBaseUrl = explicitLoginUrl ?: candidateBaseOverride ?: defaultBoundLoginUrl
         val resolvedAttendanceUrl = urlOverrides["attendance_url"]
-            ?: "$resolvedBaseUrl/dashboard.php?staff_view=attendance"
+            ?: "$effectiveStoreRoot/dashboard.php?staff_view=attendance"
         val resolvedTasksUrl = urlOverrides["tasks_url"]
-            ?: "$resolvedBaseUrl/tasks.php"
+            ?: "$effectiveStoreRoot/tasks.php"
         val resolvedNotifApiUrl = urlOverrides["notification_api_url"]
-            ?: "$resolvedBaseUrl/api/notifications.php"
+            ?: "$effectiveStoreRoot/api/notifications.php"
         val resolvedLocApiUrl = urlOverrides["location_api_url"]
-            ?: "$resolvedBaseUrl/api/location.php"
+            ?: "$effectiveStoreRoot/api/location.php"
         val resolvedSyncGpsApiUrl = urlOverrides["sync_gps_api_url"]
-            ?: "$resolvedBaseUrl/api/sync_gps.php"
+            ?: "$effectiveStoreRoot/api/sync_gps.php"
         val resolvedConfigApiUrl = urlOverrides["config_api_url"]
-            ?: "$resolvedBaseUrl/api/app_config.php"
+            ?: "$effectiveStoreRoot/api/app_config.php"
+
+        // 3. Register device against {store_url}/api/register_device.php (non-blocking if backend endpoint not yet deployed)
+        registerDeviceWithStore(
+            storeRootUrl = effectiveStoreRoot,
+            deviceId = deviceId,
+            storeCode = storeCode,
+            panelId = panelId
+        )
 
         val primaryLabel = appTitle.ifBlank { storeName.ifBlank { "বাংলা স্টোর" } }
         val parsedControl = RemoteConfigSyncer.parseRemoteControlSettings(
@@ -160,7 +194,8 @@ class ShopHandshakeManager(
             fallbackAttendanceUrl = resolvedAttendanceUrl,
             fallbackTasksUrl = resolvedTasksUrl,
             fallbackPrimaryLabel = primaryLabel,
-            includeDefaultIsp = false
+            includeDefaultIsp = false,
+            boundStoreRootUrl = effectiveStoreRoot
         ) ?: RemoteControlSettings(
             panelName = storeName.ifBlank { appTitle },
             topTabs = defaultTopTabs(
@@ -182,7 +217,7 @@ class ShopHandshakeManager(
         }
 
         ShopHandshakeResult.Success(
-            boundStoreUrl = normalizedBase,
+            boundStoreUrl = effectiveStoreRoot,
             storeCode = storeCode,
             storeName = storeName,
             appTitle = appTitle,
@@ -236,15 +271,45 @@ class ShopHandshakeManager(
         data class Error(val messageBn: String) : FetchOutcome
     }
 
+    private fun registerDeviceWithStore(
+        storeRootUrl: String,
+        deviceId: String,
+        storeCode: String,
+        panelId: String
+    ) {
+        runCatching {
+            val registerUrl = "$storeRootUrl/api/register_device.php"
+            val battery = DeviceTelemetryHelper.getBatteryLevel(context)
+            val payload = JSONObject().apply {
+                put("device_id", deviceId)
+                put("unique_device_id", deviceId)
+                put("device_model", Build.MODEL.orEmpty())
+                put("os_version", Build.VERSION.RELEASE.orEmpty())
+                put("os_version_full", DeviceTelemetryHelper.getOsVersion())
+                put("app_version", BuildConfig.VERSION_NAME)
+                if (battery in 0..100) put("battery_level", battery)
+                put("store_code", storeCode)
+                put("panel_id", panelId)
+            }
+            val requestBuilder = Request.Builder()
+                .url(registerUrl)
+                .header("Accept", "application/json")
+                .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
+            DeviceTelemetryHelper.buildRequestHeaders(context, deviceId).forEach { (k, v) ->
+                requestBuilder.header(k, v)
+            }
+            httpClient.newCall(requestBuilder.build()).execute().use { _ -> }
+        }
+    }
+
     private fun fetchJsonObject(url: String, deviceId: String): FetchOutcome {
-        val request = Request.Builder()
+        val requestBuilder = Request.Builder()
             .url(url)
             .header("Accept", "application/json")
-            .header("X-Device-Id", deviceId)
-            .header("X-Device-Model", Build.MODEL.orEmpty())
-            .header("X-OS-Version", "Android ${Build.VERSION.RELEASE.orEmpty()}")
-            .header("X-App-Version", BuildConfig.VERSION_NAME)
-            .build()
+        DeviceTelemetryHelper.buildRequestHeaders(context, deviceId).forEach { (k, v) ->
+            requestBuilder.header(k, v)
+        }
+        val request = requestBuilder.build()
 
         return try {
             httpClient.newCall(request).execute().use { response ->
@@ -276,6 +341,58 @@ class ShopHandshakeManager(
     }
 
     companion object {
+        /**
+         * Extracts a store binding URL from any QR code payload format:
+         * - Plain URL: `https://banglait.net/shop/store1` or `https://banglait.net/shop/store1/login`
+         * - JSON object: `{"store_url":"..."}`, `{"url":"..."}`, `{"base_url":"..."}`, `{"shop_url":"..."}`
+         * - Deep link URI: `banglastore://bind?url=https://...`
+         */
+        fun extractStoreUrlFromQr(rawQrText: String): String? {
+            val trimmed = rawQrText.trim()
+            if (trimmed.isBlank()) return null
+
+            if (trimmed.startsWith("{")) {
+                val parsedUrl = runCatching {
+                    val obj = JSONObject(trimmed)
+                    val directUrl = obj.optString("store_url").trim()
+                        .ifBlank { obj.optString("shop_url").trim() }
+                        .ifBlank { obj.optString("panel_url").trim() }
+                        .ifBlank { obj.optString("url").trim() }
+                        .ifBlank { obj.optString("base_url").trim() }
+                    val code = obj.optString("store_code").trim()
+                    when {
+                        directUrl.isNotBlank() && code.isNotBlank() &&
+                            !directUrl.trimEnd('/').endsWith("/$code", ignoreCase = true) &&
+                            !directUrl.contains(code, ignoreCase = true) ->
+                            "${directUrl.trimEnd('/')}/$code"
+                        directUrl.isNotBlank() -> directUrl
+                        else -> ""
+                    }
+                }.getOrNull().orEmpty()
+                if (parsedUrl.isNotBlank()) {
+                    return normalizeStoreBaseUrl(parsedUrl)
+                }
+            }
+
+            if (trimmed.contains("://") &&
+                !trimmed.startsWith("http://", ignoreCase = true) &&
+                !trimmed.startsWith("https://", ignoreCase = true)
+            ) {
+                val queryUrl = runCatching {
+                    val uri = Uri.parse(trimmed)
+                    uri.getQueryParameter("store_url")
+                        ?: uri.getQueryParameter("url")
+                        ?: uri.getQueryParameter("shop_url")
+                        ?: uri.getQueryParameter("base_url")
+                }.getOrNull().orEmpty()
+                if (queryUrl.isNotBlank()) {
+                    return normalizeStoreBaseUrl(queryUrl)
+                }
+            }
+
+            return normalizeStoreBaseUrl(trimmed)
+        }
+
         fun normalizeStoreBaseUrl(rawInput: String): String? {
             var cleaned = rawInput.trim()
             if (cleaned.isBlank()) return null
@@ -288,19 +405,22 @@ class ShopHandshakeManager(
                 cleaned = "https://" + cleaned.substring(7)
             }
 
-            // If user accidentally pasted a full API path, trim it back to the store root
+            cleaned = cleaned.trimEnd('/')
+
+            // If user pasted a full API or login path, trim back to the store root
             val suffixPatterns = listOf(
                 "/api/app_handshake.php",
+                "/api/api_handshake.php",
                 "/api/app_config.php",
                 "/index.php",
-                "/login.php"
+                "/login.php",
+                "/login"
             )
             for (suffix in suffixPatterns) {
                 if (cleaned.endsWith(suffix, ignoreCase = true)) {
-                    cleaned = cleaned.dropLast(suffix.length)
+                    cleaned = cleaned.dropLast(suffix.length).trimEnd('/')
                 }
             }
-            cleaned = cleaned.trimEnd('/')
 
             val uri = runCatching { Uri.parse(cleaned) }.getOrNull() ?: return null
             val host = uri.host.orEmpty().trim()

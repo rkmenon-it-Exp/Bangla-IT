@@ -26,14 +26,18 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Clear
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.Link
-import androidx.compose.material.icons.rounded.RestartAlt
+import androidx.compose.material.icons.rounded.LinkOff
+import androidx.compose.material.icons.rounded.QrCodeScanner
 import androidx.compose.material.icons.rounded.Storefront
 import androidx.compose.material.icons.rounded.Verified
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -43,10 +47,12 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -72,6 +78,7 @@ fun ShopBindingBottomSheet(
     config: PortalConfig,
     bindingState: ShopBindingUiState,
     onBindShopUrl: (String) -> Unit,
+    onOpenQrScanner: () -> Unit,
     onResetToDefaultStore: () -> Unit,
     onClearError: () -> Unit,
     onDismiss: () -> Unit
@@ -80,6 +87,7 @@ fun ShopBindingBottomSheet(
     var shopUrlInput by rememberSaveable(config.boundStoreUrl) {
         mutableStateOf(config.boundStoreUrl.ifBlank { "" })
     }
+    var showUnlinkConfirmDialog by remember { mutableStateOf(false) }
 
     ModalBottomSheet(
         onDismissRequest = {
@@ -114,24 +122,28 @@ fun ShopBindingBottomSheet(
                 }
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "শপ বাইন্ডিং সেটিংস (Shop Binding)",
+                        text = "শপ বাইন্ডিং (Store Setup)",
                         style = MaterialTheme.typography.titleLarge,
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.onSurface
                     )
                     Text(
-                        text = "যেকোনো শপের URL দিয়ে অ্যাপ সিঙ্ক ও রিবুট করুন",
+                        text = "URL দিয়ে অথবা QR কোড স্ক্যান করে শপ কানেক্ট করুন",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
             }
 
-            // Currently Connected Shop Summary Card
+            // Current Connection Status Card
             Card(
                 shape = RoundedCornerShape(18.dp),
                 colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.55f)
+                    containerColor = if (config.isCustomStoreBound) {
+                        MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.55f)
+                    } else {
+                        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f)
+                    }
                 ),
                 modifier = Modifier
                     .fillMaxWidth()
@@ -156,7 +168,7 @@ fun ShopBindingBottomSheet(
                             ),
                         contentAlignment = Alignment.Center
                     ) {
-                        if (config.logoUrl.isNotBlank()) {
+                        if (config.isCustomStoreBound && config.logoUrl.isNotBlank()) {
                             SubcomposeAsyncImage(
                                 model = config.logoUrl,
                                 contentDescription = config.effectiveStoreDisplayName,
@@ -185,65 +197,79 @@ fun ShopBindingBottomSheet(
                         modifier = Modifier.weight(1f),
                         verticalArrangement = Arrangement.spacedBy(2.dp)
                     ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
+                        if (config.isCustomStoreBound) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Text(
+                                    text = config.effectiveStoreDisplayName,
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Icon(
+                                    imageVector = Icons.Rounded.Verified,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
                             Text(
-                                text = config.effectiveStoreDisplayName,
-                                style = MaterialTheme.typography.titleMedium,
-                                fontWeight = FontWeight.SemiBold,
+                                text = config.boundStoreUrl,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
                             )
-                            Icon(
-                                imageVector = Icons.Rounded.Verified,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.primary,
-                                modifier = Modifier.size(16.dp)
-                            )
-                        }
-                        Text(
-                            text = config.boundStoreUrl.ifBlank { config.baseUrl },
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            val codeLabel = config.storeCode.ifBlank {
-                                config.panelId.ifBlank { "ডিফল্ট প্যানেল" }
-                            }
-                            Text(
-                                text = "কোড/প্যানেল: $codeLabel",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.primary
-                            )
-                            val parsedSwatch = parseBrandHexOrNull(config.themeColorHex)
-                            if (parsedSwatch != null) {
-                                Box(
-                                    modifier = Modifier
-                                        .size(12.dp)
-                                        .clip(CircleShape)
-                                        .background(parsedSwatch)
-                                        .border(1.dp, MaterialTheme.colorScheme.outline, CircleShape)
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                val codeLabel = config.storeCode.ifBlank {
+                                    config.panelId.ifBlank { "Bound Store" }
+                                }
+                                Text(
+                                    text = "স্টোর কোড: $codeLabel",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.primary
                                 )
+                                val parsedSwatch = parseBrandHexOrNull(config.themeColorHex)
+                                if (parsedSwatch != null) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(12.dp)
+                                            .clip(CircleShape)
+                                            .background(parsedSwatch)
+                                            .border(1.dp, MaterialTheme.colorScheme.outline, CircleShape)
+                                    )
+                                }
                             }
+                        } else {
+                            Text(
+                                text = "কোনো শপ যুক্ত নেই (Not Bound)",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                text = "বর্তমানে ডিফল্ট পোর্টাল চালু আছে। নিচে আপনার শপের URL দিন অথবা QR কোড স্ক্যান করুন।",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
                         }
                     }
                 }
             }
 
+            // Method A: Direct Store URL Input
             OutlinedTextField(
                 value = shopUrlInput,
                 onValueChange = {
                     shopUrlInput = it
                     if (bindingState.errorMessage != null) onClearError()
                 },
-                label = { Text("শপ বাইন্ডিং URL (Enter Store URL)") },
+                label = { Text("শপের URL দিন (Enter Store URL)") },
                 placeholder = { Text("https://banglait.net/shop/store1") },
                 leadingIcon = {
                     Icon(
@@ -282,7 +308,7 @@ fun ShopBindingBottomSheet(
             )
 
             Text(
-                text = "URL সাবমিট করলে ওই শপের api/app_handshake.php থেকে লোগো, থিম কালার, উপরের ট্যাব, নিচের বাটন এবং কন্ট্রোল প্যানেলের সব সেটিংস সিঙ্ক হয়ে অ্যাপ রিবুট হবে।",
+                text = "বাইন্ড সম্পন্ন হলে অ্যাপ রিবুট হবে এবং শুধুমাত্র ওই শপের লগইন পোর্টাল, লোগো, ট্যাব ও কন্ট্রোল প্যানেল সেটিংস চালু হবে।",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -345,31 +371,91 @@ fun ShopBindingBottomSheet(
                         modifier = Modifier.size(18.dp)
                     )
                     Spacer(modifier = Modifier.width(8.dp))
-                    Text("শপ বাইন্ড ও অ্যাপ রিবুট করুন")
+                    Text("বাইন্ড করুন / Connect")
                 }
+            }
+
+            // Method B: QR Code Scanner Fallback
+            FilledTonalButton(
+                onClick = onOpenQrScanner,
+                enabled = !bindingState.isLoading,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 50.dp)
+                    .testTag("shop_binding_scan_qr_button")
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.QrCodeScanner,
+                    contentDescription = null,
+                    modifier = Modifier.size(20.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("কিউআর কোড স্ক্যান করুন (Scan QR Code)")
             }
 
             if (config.isCustomStoreBound) {
                 HorizontalDivider()
                 OutlinedButton(
-                    onClick = onResetToDefaultStore,
+                    onClick = { showUnlinkConfirmDialog = true },
                     enabled = !bindingState.isLoading,
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        contentColor = MaterialTheme.colorScheme.error
+                    ),
                     modifier = Modifier
                         .fillMaxWidth()
                         .heightIn(min = 48.dp)
                         .testTag("shop_binding_reset_button")
                 ) {
                     Icon(
-                        imageVector = Icons.Rounded.RestartAlt,
+                        imageVector = Icons.Rounded.LinkOff,
                         contentDescription = null,
                         modifier = Modifier.size(18.dp)
                     )
                     Spacer(modifier = Modifier.width(8.dp))
-                    Text("ডিফল্ট বাংলা স্টোর-এ ফিরে যান ও রিবুট করুন")
+                    Text("শপ আনলিংক ও রিবুট করুন (Unlink Store)")
                 }
             }
 
             Spacer(modifier = Modifier.height(6.dp))
         }
+    }
+
+    if (showUnlinkConfirmDialog) {
+        AlertDialog(
+            onDismissRequest = { showUnlinkConfirmDialog = false },
+            icon = {
+                Icon(
+                    imageVector = Icons.Rounded.LinkOff,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.error
+                )
+            },
+            title = { Text("শপ আনলিংক করবেন?") },
+            text = {
+                Text(
+                    "\"${config.effectiveStoreDisplayName}\" থেকে অ্যাপটি আনলিংক করলে বর্তমান লগইন সেশন, ব্যাকগ্রাউন্ড GPS ও শপের ডেটা মুছে যাবে এবং অ্যাপটি রিবুট হয়ে সাধারণ ডিফল্ট পোর্টালে ফিরে যাবে।"
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showUnlinkConfirmDialog = false
+                        onResetToDefaultStore()
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error,
+                        contentColor = MaterialTheme.colorScheme.onError
+                    ),
+                    modifier = Modifier.testTag("shop_binding_confirm_unlink_button")
+                ) {
+                    Text("আনলিংক ও রিবুট করুন")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showUnlinkConfirmDialog = false }) {
+                    Text("বাতিল")
+                }
+            }
+        )
     }
 }

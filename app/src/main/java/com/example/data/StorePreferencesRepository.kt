@@ -16,6 +16,7 @@ import com.example.model.AppTab
 import com.example.model.DEFAULT_ATTENDANCE_URL
 import com.example.model.DEFAULT_BASE_URL
 import com.example.model.DEFAULT_CONFIG_API_URL
+import com.example.model.DEFAULT_GENERIC_PORTAL_URL
 import com.example.model.DEFAULT_LOCATION_API_URL
 import com.example.model.DEFAULT_NOTIFICATION_API_URL
 import com.example.model.DEFAULT_SYNC_GPS_API_URL
@@ -33,6 +34,7 @@ import com.example.model.TaskRefreshMode
 import com.example.model.UserRole
 import com.example.model.defaultBottomTabs
 import com.example.model.defaultTopTabs
+import com.example.sync.DeviceTelemetryHelper
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
@@ -54,6 +56,7 @@ class StorePreferencesRepository(private val context: Context) {
         val LOCATION_API_URL = stringPreferencesKey("location_api_url")
         val SYNC_GPS_API_URL = stringPreferencesKey("sync_gps_api_url")
         val CONFIG_API_URL = stringPreferencesKey("config_api_url")
+        val IS_BOUND = booleanPreferencesKey("is_bound")
         val BOUND_STORE_URL = stringPreferencesKey("bound_store_url")
         val STORE_CODE = stringPreferencesKey("store_code")
         val STORE_NAME = stringPreferencesKey("store_name")
@@ -92,44 +95,64 @@ class StorePreferencesRepository(private val context: Context) {
     }
 
     val configFlow: Flow<PortalConfig> = context.banglaStoreDataStore.data.map { prefs ->
-        val boundStore = prefs[Keys.BOUND_STORE_URL].orEmpty().trim()
-        val effectiveBase = prefs[Keys.BASE_URL]?.ifBlank { null }
-            ?: boundStore.ifBlank { DEFAULT_BASE_URL }
-        val storedAtt = prefs[Keys.ATTENDANCE_URL]
-        val storedTasks = prefs[Keys.TASKS_URL]
+        val boundStore = prefs[Keys.BOUND_STORE_URL].orEmpty().trim().trimEnd('/')
+        val isBound = (prefs[Keys.IS_BOUND] ?: false) && boundStore.isNotBlank()
         val legacyTab = AppTab.fromRoute(prefs[Keys.PREVIOUS_TAB])
         val storedTabId = prefs[Keys.PREVIOUS_TAB_ID]?.takeIf { it.isNotBlank() } ?: legacyTab.route
 
-        val fallbackAtt = if (boundStore.isNotBlank()) {
-            "${boundStore.trimEnd('/')}/dashboard.php?staff_view=attendance"
-        } else {
-            DEFAULT_ATTENDANCE_URL
+        if (!isBound) {
+            // Unbound startup: NEVER auto-connect to any store's API/GPS/notifications.
+            // Only display the default generic portal login page.
+            return@map PortalConfig(
+                isBound = false,
+                baseUrl = DEFAULT_GENERIC_PORTAL_URL,
+                attendanceUrl = "",
+                tasksUrl = "",
+                notificationApiUrl = "",
+                locationApiUrl = "",
+                syncGpsApiUrl = "",
+                configApiUrl = "",
+                boundStoreUrl = "",
+                storeCode = "",
+                storeName = "",
+                appTitle = "",
+                logoUrl = "",
+                themeColorHex = "",
+                panelId = "",
+                userRole = UserRole.fromKey(prefs[Keys.USER_ROLE]),
+                userId = "",
+                userName = "",
+                isLoggedIn = false,
+                previousTab = AppTab.PORTAL,
+                previousTabId = AppTab.PORTAL.route,
+                previousUrl = "",
+                autoRefreshOnTaskComplete = prefs[Keys.AUTO_REFRESH_ON_COMPLETE] ?: true,
+                backgroundSyncEnabled = prefs[Keys.BACKGROUND_SYNC_ENABLED] ?: true,
+                gpsTrackingEnabled = prefs[Keys.GPS_TRACKING_ENABLED] ?: true,
+                remoteControl = RemoteControlSettings(
+                    topTabs = emptyList(),
+                    bottomTabs = emptyList(),
+                    notificationsEnabled = false,
+                    backgroundSyncEnabled = false,
+                    gpsEnabled = false,
+                    gpsMode = GpsCollectionMode.OFF,
+                    gpsBackgroundEnabled = false,
+                    taskAutoRefreshEnabled = false
+                )
+            )
         }
-        val fallbackTasks = if (boundStore.isNotBlank()) {
-            "${boundStore.trimEnd('/')}/tasks.php"
-        } else {
-            DEFAULT_TASKS_URL
-        }
-        val fallbackNotifApi = if (boundStore.isNotBlank()) {
-            "${boundStore.trimEnd('/')}/api/notifications.php"
-        } else {
-            DEFAULT_NOTIFICATION_API_URL
-        }
-        val fallbackLocApi = if (boundStore.isNotBlank()) {
-            "${boundStore.trimEnd('/')}/api/location.php"
-        } else {
-            DEFAULT_LOCATION_API_URL
-        }
-        val fallbackSyncGpsApi = if (boundStore.isNotBlank()) {
-            "${boundStore.trimEnd('/')}/api/sync_gps.php"
-        } else {
-            DEFAULT_SYNC_GPS_API_URL
-        }
-        val fallbackConfigApi = if (boundStore.isNotBlank()) {
-            "${boundStore.trimEnd('/')}/api/app_config.php"
-        } else {
-            DEFAULT_CONFIG_API_URL
-        }
+
+        val fallbackLoginUrl = "$boundStore/login"
+        val effectiveBase = prefs[Keys.BASE_URL]?.ifBlank { null } ?: fallbackLoginUrl
+        val storedAtt = prefs[Keys.ATTENDANCE_URL]
+        val storedTasks = prefs[Keys.TASKS_URL]
+
+        val fallbackAtt = "$boundStore/dashboard.php?staff_view=attendance"
+        val fallbackTasks = "$boundStore/tasks.php"
+        val fallbackNotifApi = "$boundStore/api/notifications.php"
+        val fallbackLocApi = "$boundStore/api/location.php"
+        val fallbackSyncGpsApi = "$boundStore/api/sync_gps.php"
+        val fallbackConfigApi = "$boundStore/api/app_config.php"
 
         val storeDisplayName = prefs[Keys.APP_TITLE].orEmpty().ifBlank {
             prefs[Keys.STORE_NAME].orEmpty().ifBlank { "বাংলা স্টোর" }
@@ -140,21 +163,14 @@ class StorePreferencesRepository(private val context: Context) {
             fallbackAttendanceUrl = fallbackAtt,
             fallbackTasksUrl = fallbackTasks,
             fallbackPrimaryLabel = storeDisplayName,
-            includeDefaultIsp = boundStore.isBlank()
+            includeDefaultIsp = false
         )
 
         PortalConfig(
+            isBound = true,
             baseUrl = effectiveBase,
-            attendanceUrl = if (storedAtt.isNullOrBlank() || (boundStore.isBlank() && storedAtt == DEFAULT_BASE_URL)) {
-                fallbackAtt
-            } else {
-                storedAtt
-            },
-            tasksUrl = if (storedTasks.isNullOrBlank() || (boundStore.isBlank() && storedTasks == DEFAULT_BASE_URL)) {
-                fallbackTasks
-            } else {
-                storedTasks
-            },
+            attendanceUrl = storedAtt?.ifBlank { fallbackAtt } ?: fallbackAtt,
+            tasksUrl = storedTasks?.ifBlank { fallbackTasks } ?: fallbackTasks,
             notificationApiUrl = prefs[Keys.NOTIFICATION_API_URL]?.ifBlank { fallbackNotifApi }
                 ?: fallbackNotifApi,
             locationApiUrl = prefs[Keys.LOCATION_API_URL]?.ifBlank { fallbackLocApi }
@@ -222,29 +238,35 @@ class StorePreferencesRepository(private val context: Context) {
 
     suspend fun saveConfig(config: PortalConfig) {
         context.banglaStoreDataStore.edit { prefs ->
-            prefs[Keys.BASE_URL] = sanitizeHttpsUrl(config.baseUrl, DEFAULT_BASE_URL)
-            prefs[Keys.ATTENDANCE_URL] = sanitizeHttpsUrl(config.attendanceUrl, DEFAULT_ATTENDANCE_URL)
-            prefs[Keys.TASKS_URL] = sanitizeHttpsUrl(config.tasksUrl, DEFAULT_TASKS_URL)
-            prefs[Keys.NOTIFICATION_API_URL] = sanitizeHttpsUrl(
-                config.notificationApiUrl,
-                DEFAULT_NOTIFICATION_API_URL
-            )
-            prefs[Keys.LOCATION_API_URL] = sanitizeHttpsUrl(
-                config.locationApiUrl,
-                DEFAULT_LOCATION_API_URL
-            )
-            prefs[Keys.SYNC_GPS_API_URL] = sanitizeHttpsUrl(
-                config.syncGpsApiUrl,
-                DEFAULT_SYNC_GPS_API_URL
-            )
-            prefs[Keys.CONFIG_API_URL] = sanitizeHttpsUrl(
-                config.configApiUrl,
-                DEFAULT_CONFIG_API_URL
-            )
-            prefs[Keys.PANEL_ID] = config.panelId.trim()
-            prefs[Keys.USER_ROLE] = config.userRole.key
-            prefs[Keys.USER_ID] = config.userId.trim()
-            prefs[Keys.USER_NAME] = config.userName.trim()
+            val boundRoot = prefs[Keys.BOUND_STORE_URL].orEmpty().trim().trimEnd('/')
+            if (boundRoot.isNotBlank()) {
+                prefs[Keys.BASE_URL] = sanitizeHttpsUrl(config.baseUrl, "$boundRoot/login")
+                prefs[Keys.ATTENDANCE_URL] = sanitizeHttpsUrl(
+                    config.attendanceUrl,
+                    "$boundRoot/dashboard.php?staff_view=attendance"
+                )
+                prefs[Keys.TASKS_URL] = sanitizeHttpsUrl(config.tasksUrl, "$boundRoot/tasks.php")
+                prefs[Keys.NOTIFICATION_API_URL] = sanitizeHttpsUrl(
+                    config.notificationApiUrl,
+                    "$boundRoot/api/notifications.php"
+                )
+                prefs[Keys.LOCATION_API_URL] = sanitizeHttpsUrl(
+                    config.locationApiUrl,
+                    "$boundRoot/api/location.php"
+                )
+                prefs[Keys.SYNC_GPS_API_URL] = sanitizeHttpsUrl(
+                    config.syncGpsApiUrl,
+                    "$boundRoot/api/sync_gps.php"
+                )
+                prefs[Keys.CONFIG_API_URL] = sanitizeHttpsUrl(
+                    config.configApiUrl,
+                    "$boundRoot/api/app_config.php"
+                )
+                prefs[Keys.PANEL_ID] = config.panelId.trim()
+                prefs[Keys.USER_ROLE] = config.userRole.key
+                prefs[Keys.USER_ID] = config.userId.trim()
+                prefs[Keys.USER_NAME] = config.userName.trim()
+            }
             prefs[Keys.AUTO_REFRESH_ON_COMPLETE] = config.autoRefreshOnTaskComplete
             prefs[Keys.BACKGROUND_SYNC_ENABLED] = config.backgroundSyncEnabled
             prefs[Keys.GPS_TRACKING_ENABLED] = config.gpsTrackingEnabled
@@ -325,6 +347,7 @@ class StorePreferencesRepository(private val context: Context) {
             prefs[Keys.PREVIOUS_URL] = ""
 
             // Persist new bound shop metadata & endpoints
+            prefs[Keys.IS_BOUND] = true
             prefs[Keys.BOUND_STORE_URL] = cleanBound
             prefs[Keys.STORE_CODE] = storeCode.trim()
             prefs[Keys.STORE_NAME] = storeName.trim()
@@ -333,7 +356,7 @@ class StorePreferencesRepository(private val context: Context) {
             prefs[Keys.THEME_COLOR_HEX] = themeColorHex.trim()
             prefs[Keys.PANEL_ID] = panelId.trim().ifBlank { storeCode.trim() }
 
-            prefs[Keys.BASE_URL] = sanitizeHttpsUrl(baseUrl, cleanBound)
+            prefs[Keys.BASE_URL] = sanitizeHttpsUrl(baseUrl, "$cleanBound/login")
             prefs[Keys.ATTENDANCE_URL] = sanitizeHttpsUrl(attendanceUrl, "$cleanBound/dashboard.php?staff_view=attendance")
             prefs[Keys.TASKS_URL] = sanitizeHttpsUrl(tasksUrl, "$cleanBound/tasks.php")
             prefs[Keys.NOTIFICATION_API_URL] = sanitizeHttpsUrl(notificationApiUrl, "$cleanBound/api/notifications.php")
@@ -348,6 +371,7 @@ class StorePreferencesRepository(private val context: Context) {
 
     suspend fun resetToDefaultStore() {
         context.banglaStoreDataStore.edit { prefs ->
+            prefs[Keys.IS_BOUND] = false
             prefs[Keys.BOUND_STORE_URL] = ""
             prefs[Keys.STORE_CODE] = ""
             prefs[Keys.STORE_NAME] = ""
@@ -355,13 +379,13 @@ class StorePreferencesRepository(private val context: Context) {
             prefs[Keys.LOGO_URL] = ""
             prefs[Keys.THEME_COLOR_HEX] = ""
             prefs[Keys.PANEL_ID] = ""
-            prefs[Keys.BASE_URL] = DEFAULT_BASE_URL
-            prefs[Keys.ATTENDANCE_URL] = DEFAULT_ATTENDANCE_URL
-            prefs[Keys.TASKS_URL] = DEFAULT_TASKS_URL
-            prefs[Keys.NOTIFICATION_API_URL] = DEFAULT_NOTIFICATION_API_URL
-            prefs[Keys.LOCATION_API_URL] = DEFAULT_LOCATION_API_URL
-            prefs[Keys.SYNC_GPS_API_URL] = DEFAULT_SYNC_GPS_API_URL
-            prefs[Keys.CONFIG_API_URL] = DEFAULT_CONFIG_API_URL
+            prefs[Keys.BASE_URL] = DEFAULT_GENERIC_PORTAL_URL
+            prefs[Keys.ATTENDANCE_URL] = ""
+            prefs[Keys.TASKS_URL] = ""
+            prefs[Keys.NOTIFICATION_API_URL] = ""
+            prefs[Keys.LOCATION_API_URL] = ""
+            prefs[Keys.SYNC_GPS_API_URL] = ""
+            prefs[Keys.CONFIG_API_URL] = ""
             prefs[Keys.REMOTE_CONTROL_JSON] = ""
             prefs[Keys.IS_LOGGED_IN] = false
             prefs[Keys.USER_ID] = ""
@@ -378,11 +402,14 @@ class StorePreferencesRepository(private val context: Context) {
             prefs[Keys.PREVIOUS_TAB_ID] = AppTab.PORTAL.route
             prefs[Keys.PREVIOUS_URL] = ""
             prefs[Keys.LAST_SYNC_TIME] = 0L
-            prefs[Keys.LAST_SYNC_STATUS] = "ডিফল্ট বাংলা স্টোর রিসেট হয়েছে"
+            prefs[Keys.LAST_SYNC_STATUS] = "কোনো শপ যুক্ত নেই (Unbound)"
         }
     }
 
     suspend fun getOrCreateUniqueDeviceId(): String {
+        val hardwareId = DeviceTelemetryHelper.getDeviceId(context)
+        if (hardwareId.isNotBlank()) return hardwareId
+
         var deviceId = ""
         context.banglaStoreDataStore.edit { prefs ->
             val existing = prefs[Keys.DEVICE_UUID].orEmpty().trim()
@@ -407,30 +434,41 @@ class StorePreferencesRepository(private val context: Context) {
         panelId: String? = null
     ) {
         context.banglaStoreDataStore.edit { prefs ->
+            val isBound = (prefs[Keys.IS_BOUND] ?: false) &&
+                prefs[Keys.BOUND_STORE_URL].orEmpty().isNotBlank()
+            if (!isBound) {
+                return@edit
+            }
+
             val cleanNewPanel = panelId?.trim().orEmpty()
             val oldPanel = prefs[Keys.PANEL_ID].orEmpty().trim()
+            val boundStoreCode = prefs[Keys.STORE_CODE].orEmpty().trim()
             val cleanNewUser = userId?.trim().orEmpty()
             val oldUser = prefs[Keys.USER_ID].orEmpty().trim()
 
-            val panelChanged = cleanNewPanel.isNotBlank() &&
-                oldPanel.isNotBlank() &&
-                !cleanNewPanel.equals(oldPanel, ignoreCase = true)
+            // Strict tenant lock: when bound to a specific panel, ignore conflicting cross-panel meta tags
+            val lockedPanel = oldPanel.ifBlank { boundStoreCode }
+            if (lockedPanel.isNotBlank() &&
+                cleanNewPanel.isNotBlank() &&
+                !cleanNewPanel.equals(lockedPanel, ignoreCase = true)
+            ) {
+                return@edit
+            }
+
             val userChanged = cleanNewUser.isNotBlank() &&
                 oldUser.isNotBlank() &&
                 !cleanNewUser.equals(oldUser, ignoreCase = true)
 
-            // Strict isolation: wipe cached inbox, version, and previous panel config when switching panels/users
-            if (panelChanged || userChanged) {
+            if (userChanged) {
                 prefs[Keys.NOTIFICATIONS_JSON] = "[]"
                 prefs[Keys.SEEN_EVENT_IDS] = emptySet()
                 prefs[Keys.LAST_TASK_VERSION] = ""
-                prefs[Keys.REMOTE_CONTROL_JSON] = ""
                 prefs[Keys.PREVIOUS_URL] = ""
                 prefs[Keys.LAST_FULFILLED_GPS_REQUEST_ID] = ""
                 prefs[Keys.LAST_GPS_UPLOAD_TIME] = 0L
             }
 
-            if (cleanNewPanel.isNotBlank()) {
+            if (oldPanel.isBlank() && cleanNewPanel.isNotBlank()) {
                 prefs[Keys.PANEL_ID] = cleanNewPanel
             }
             if (role != null) prefs[Keys.USER_ROLE] = role.key

@@ -21,7 +21,8 @@ class LocationSyncWorker(
     override suspend fun doWork(): Result {
         val repository = StorePreferencesRepository(applicationContext)
         val config = repository.getConfigSnapshot()
-        if (!config.gpsTrackingEnabled ||
+        if (!config.isCustomStoreBound ||
+            !config.gpsTrackingEnabled ||
             !config.remoteControl.gpsEnabled ||
             !config.remoteControl.gpsBackgroundEnabled ||
             config.remoteControl.gpsMode == GpsCollectionMode.OFF
