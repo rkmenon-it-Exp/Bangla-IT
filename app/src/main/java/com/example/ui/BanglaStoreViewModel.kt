@@ -35,6 +35,7 @@ import com.example.model.defaultBottomTabs
 import com.example.model.defaultTopTabs
 import com.example.notifications.NotificationHelper
 import com.example.sync.AppUpdateChecker
+import com.example.sync.DeviceDisconnectManager
 import com.example.sync.DeviceTelemetryHelper
 import com.example.sync.ImmediateSyncWorker
 import com.example.sync.NetworkMonitor
@@ -197,6 +198,8 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
     private val _snackbarMessages = MutableSharedFlow<String>(extraBufferCapacity = 16)
     val snackbarMessages: SharedFlow<String> = _snackbarMessages.asSharedFlow()
 
+    val remoteDisconnectEvents: SharedFlow<String> = DeviceDisconnectManager.disconnectEvents
+
     private data class WebAggregate(
         val selectedWorkspaceId: String,
         val openedWorkspaceIds: Set<String>,
@@ -326,8 +329,7 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
                 it.type == NotificationEventType.ATTENDANCE_SUBMITTED
             }
             AlertFilter.TASKS -> allNotifications.filter {
-                it.type == NotificationEventType.TASK_ASSIGNED ||
-                    it.type == NotificationEventType.TASK_COMPLETED
+                it.type.isTaskEvent
             }
         }
 
@@ -424,6 +426,7 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
                     when (rawNotif.type) {
                         NotificationEventType.ATTENDANCE_SUBMITTED -> config.attendanceUrl
                         NotificationEventType.TASK_ASSIGNED,
+                        NotificationEventType.TASK_UPDATED,
                         NotificationEventType.TASK_COMPLETED -> config.tasksUrl
                         NotificationEventType.GPS_REQUEST,
                         NotificationEventType.GENERAL -> config.baseUrl
@@ -433,21 +436,27 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
                     panelId = rawNotif.panelId.ifBlank { config.panelId },
                     targetUrl = resolvedTargetUrl
                 )
+                if (!shouldShowForCurrentRole(finalNotif, config)) {
+                    return@launch
+                }
                 val isNew = repository.recordIncomingNotification(finalNotif, deduplicate = true)
-                val canDeliver = remoteControl.notificationsEnabled &&
-                    remoteControl.alertDeliveryMode != AlertDeliveryMode.OFF
-                if (isNew && canDeliver && shouldShowForCurrentRole(finalNotif, config)) {
+                val canDeliver = remoteControl.notificationsEnabled && (
+                    remoteControl.alertDeliveryMode != AlertDeliveryMode.OFF ||
+                        finalNotif.type.isTaskEvent
+                    )
+                if (isNew && canDeliver) {
                     NotificationHelper.showNotification(
-                        getApplication(),
-                        finalNotif,
-                        remoteControl.alertDeliveryMode
+                        context = getApplication(),
+                        notification = finalNotif,
+                        deliveryMode = remoteControl.alertDeliveryMode,
+                        currentRole = config.userRole
                     )
                     _snackbarMessages.tryEmit(finalNotif.title)
                 }
-                if (shouldAutoRefresh) {
+                if (shouldAutoRefresh || finalNotif.type.isTaskEvent) {
                     tryAutoRefreshTasks(
                         config = config,
-                        message = "টাস্ক আপডেট হয়েছে — পেজ অটো-রিফ্রেশ করা হচ্ছে"
+                        message = "টাস্ক আপডেট হয়েছে — টাস্ক পেজ অটো-রিফ্রেশ করা হচ্ছে"
                     )
                 }
             }
@@ -455,7 +464,10 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         onRefreshRequestedCallback = { targetUrl ->
             viewModelScope.launch {
                 if (targetUrl.isNullOrBlank()) {
-                    _webViewCommands.tryEmit(WebViewCommand.Reload)
+                    tryAutoRefreshTasks(
+                        config = repository.getConfigSnapshot(),
+                        message = "টাস্ক পেজ রিফ্রেশ হচ্ছে"
+                    )
                 } else {
                     _webViewCommands.tryEmit(WebViewCommand.LoadUrl(targetUrl))
                 }
@@ -473,6 +485,16 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
                 if (snap != null) {
                     _snackbarMessages.tryEmit("প্যানেল রিকোয়েস্ট অনুযায়ী GPS পাঠানো হয়েছে")
                 }
+            }
+        },
+        onDeviceDisconnectedCallback = { reason ->
+            viewModelScope.launch {
+                DeviceDisconnectManager.executeFullResetAndWipe(
+                    context = getApplication(),
+                    repository = repository,
+                    reasonMessage = reason,
+                    showNotification = false
+                )
             }
         },
         onInnerScrollChangedCallback = { scrolled ->
@@ -1191,7 +1213,8 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
 
     private fun tryAutoRefreshTasks(config: PortalConfig, message: String) {
         val rc = config.remoteControl
-        if (!config.autoRefreshOnTaskComplete ||
+        if (!config.isCustomStoreBound ||
+            !config.autoRefreshOnTaskComplete ||
             !rc.taskAutoRefreshEnabled ||
             rc.taskRefreshMode == TaskRefreshMode.OFF
         ) {
@@ -1200,15 +1223,24 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
 
         val stateSnapshot = uiState.value
         val activeWorkspaceIsPrimary = stateSnapshot.activeWorkspaceTab.isPrimaryStore
-        if (rc.refreshOnlyOnTabs.isNotEmpty()) {
-            val activeTab = stateSnapshot.selectedBottomTabId.lowercase()
-            if (!activeWorkspaceIsPrimary || activeTab !in rc.refreshOnlyOnTabs) {
-                return
-            }
+        if (!activeWorkspaceIsPrimary || stateSnapshot.isAlertsOverlayVisible) {
+            return
+        }
+
+        // Strict policy: NEVER auto-refresh Portal or Attendance — ONLY refresh when user is on
+        // the Tasks tab or viewing a Task page URL!
+        val activeTabId = stateSnapshot.selectedBottomTabId.lowercase()
+        val isOnTasksTab = activeTabId == AppTab.TASKS.route || activeTabId.contains("task")
+        val currentUrlLower = stateSnapshot.currentUrl.lowercase()
+        val isOnTaskUrl = currentUrlLower.contains("task") ||
+            (config.tasksUrl.isNotBlank() && urlsEffectivelyEqual(stateSnapshot.currentUrl, config.tasksUrl))
+
+        if (!isOnTasksTab && !isOnTaskUrl) {
+            return
         }
 
         val now = System.currentTimeMillis()
-        val cooldownMs = rc.refreshCooldownSeconds.coerceIn(5, 3600) * 1000L
+        val cooldownMs = rc.refreshCooldownSeconds.coerceIn(3, 15) * 1000L
         if (now - lastAutoRefreshMillis < cooldownMs) {
             return
         }
@@ -1227,6 +1259,7 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
             val nextTabId = when (notification.type) {
                 NotificationEventType.ATTENDANCE_SUBMITTED -> AppTab.ATTENDANCE.route
                 NotificationEventType.TASK_ASSIGNED,
+                NotificationEventType.TASK_UPDATED,
                 NotificationEventType.TASK_COMPLETED -> AppTab.TASKS.route
                 NotificationEventType.GPS_REQUEST,
                 NotificationEventType.GENERAL -> AppTab.PORTAL.route
@@ -1275,6 +1308,7 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
             val desiredId = when (type) {
                 NotificationEventType.ATTENDANCE_SUBMITTED -> AppTab.ATTENDANCE.route
                 NotificationEventType.TASK_ASSIGNED,
+                NotificationEventType.TASK_UPDATED,
                 NotificationEventType.TASK_COMPLETED -> AppTab.TASKS.route
                 NotificationEventType.GPS_REQUEST,
                 NotificationEventType.GENERAL -> AppTab.PORTAL.route
@@ -1299,9 +1333,24 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         ) {
             return false
         }
-        val roleMatches = notif.targetRole == "all" ||
-            notif.targetRole.equals(config.userRole.key, ignoreCase = true)
+
+        // Strict policy: ONLY Admin and Manager phones receive Attendance notifications
+        if (notif.type == NotificationEventType.ATTENDANCE_SUBMITTED &&
+            !config.userRole.canReceiveAttendanceAlerts
+        ) {
+            return false
+        }
+
+        val targetRoles = notif.targetRole
+            .split(",", "|", " ")
+            .map { it.trim().lowercase() }
+            .filter { it.isNotBlank() }
+
+        val roleMatches = targetRoles.isEmpty() ||
+            "all" in targetRoles ||
+            config.userRole.key.lowercase() in targetRoles
         if (!roleMatches) return false
+
         return notif.targetUserId.isBlank() ||
             config.userId.isBlank() ||
             notif.targetUserId.equals(config.userId, ignoreCase = true)
@@ -1383,20 +1432,15 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         viewModelScope.launch {
             _shopBindingState.value = ShopBindingUiState(
                 isLoading = true,
-                statusMessage = "শপ আনলিংক ও অ্যাপ রিবুট হচ্ছে..."
+                statusMessage = "শপ আনলিংক, ডেটা ক্লিয়ার ও অ্যাপ রিবুট হচ্ছে..."
             )
-            val ctx = getApplication<Application>()
-            LocationPermissionHelper.stopTrackingService(ctx)
-            NotificationSyncWorker.schedulePeriodicSync(ctx, enabled = false)
-            LocationSyncWorker.schedulePeriodicLocationSync(ctx, enabled = false)
-            runCatching {
-                val cm = CookieManager.getInstance()
-                cm.removeAllCookies(null)
-                cm.flush()
-            }
-            offlinePageCache.clearAll()
+            DeviceDisconnectManager.executeFullResetAndWipe(
+                context = getApplication(),
+                repository = repository,
+                showNotification = false,
+                emitRebootEvent = false
+            )
             _cachedPages.value = emptyList()
-            repository.resetToDefaultStore()
             delay(200)
             _shopBindingState.value = ShopBindingUiState(isLoading = false)
             onReadyToReboot()

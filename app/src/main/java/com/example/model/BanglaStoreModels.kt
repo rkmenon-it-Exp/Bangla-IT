@@ -10,17 +10,27 @@ enum class UserRole(
         labelBn = "অ্যাডমিন (Admin)",
         shortLabel = "Admin"
     ),
+    MANAGER(
+        key = "manager",
+        labelBn = "ম্যানেজার (Manager)",
+        shortLabel = "Manager"
+    ),
     STAFF(
         key = "staff",
         labelBn = "স্টাফ / কর্মী (Staff)",
         shortLabel = "Staff"
     );
 
+    val canReceiveAttendanceAlerts: Boolean
+        get() = this == ADMIN || this == MANAGER
+
     companion object {
         fun fromKey(raw: String?): UserRole {
             return when (raw?.trim()?.lowercase()) {
-                "staff", "employee", "user", "worker" -> STAFF
-                else -> ADMIN
+                "admin", "super_admin", "superadmin", "owner" -> ADMIN
+                "manager", "store_manager", "branch_manager", "supervisor", "maneger" -> MANAGER
+                "staff", "employee", "user", "worker", "technician" -> STAFF
+                else -> STAFF
             }
         }
     }
@@ -41,6 +51,11 @@ enum class NotificationEventType(
         labelBn = "নতুন টাস্ক",
         labelEn = "Task Assigned"
     ),
+    TASK_UPDATED(
+        key = "task_updated",
+        labelBn = "টাস্ক প্রসেস / আপডেট",
+        labelEn = "Task In Progress"
+    ),
     TASK_COMPLETED(
         key = "task_completed",
         labelBn = "কাজ সম্পন্ন",
@@ -57,9 +72,21 @@ enum class NotificationEventType(
         labelEn = "Notice"
     );
 
+    val isTaskEvent: Boolean
+        get() = this == TASK_ASSIGNED || this == TASK_UPDATED || this == TASK_COMPLETED
+
     companion object {
         fun fromKey(raw: String?): NotificationEventType {
-            return entries.firstOrNull { it.key.equals(raw?.trim(), ignoreCase = true) } ?: GENERAL
+            val normalized = raw?.trim()?.lowercase().orEmpty()
+            return when (normalized) {
+                "attendance_submitted", "attendance", "staff_attendance" -> ATTENDANCE_SUBMITTED
+                "task_assigned", "task_added", "task_created", "new_task" -> TASK_ASSIGNED
+                "task_updated", "task_in_progress", "task_processing", "task_process",
+                "task_status_changed", "task_started", "task_progress" -> TASK_UPDATED
+                "task_completed", "task_done", "task_finished", "task_complete" -> TASK_COMPLETED
+                "gps_request", "location_request" -> GPS_REQUEST
+                else -> entries.firstOrNull { it.key.equals(normalized, ignoreCase = true) } ?: GENERAL
+            }
         }
     }
 }
@@ -149,8 +176,8 @@ data class RemoteControlSettings(
     val gpsBackgroundEnabled: Boolean = true,
     val taskAutoRefreshEnabled: Boolean = true,
     val taskRefreshMode: TaskRefreshMode = TaskRefreshMode.VERSION_AND_EVENTS,
-    val refreshCooldownSeconds: Int = 20,
-    val refreshOnlyOnTabs: List<String> = emptyList()
+    val refreshCooldownSeconds: Int = 5,
+    val refreshOnlyOnTabs: List<String> = listOf("tasks")
 )
 
 data class StoreNotification(
@@ -208,7 +235,7 @@ data class PortalConfig(
     val logoUrl: String = "",
     val themeColorHex: String = "",
     val panelId: String = "",
-    val userRole: UserRole = UserRole.ADMIN,
+    val userRole: UserRole = UserRole.STAFF,
     val userId: String = "",
     val userName: String = "",
     val isLoggedIn: Boolean = false,

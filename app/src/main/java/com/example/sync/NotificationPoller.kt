@@ -27,6 +27,7 @@ data class PollSyncResult(
     val newNotificationsCount: Int,
     val shouldAutoRefreshTasks: Boolean,
     val gpsRequestFulfilled: Boolean = false,
+    val deviceDisconnected: Boolean = false,
     val statusMessage: String
 )
 
@@ -72,6 +73,31 @@ class NotificationPoller(
         return@withContext try {
             httpClient.newCall(request).execute().use { response ->
                 val now = System.currentTimeMillis()
+                val bodyString = response.body?.string().orEmpty().trim()
+                val preParsedObj = if (bodyString.startsWith("{")) {
+                    runCatching { JSONObject(bodyString) }.getOrNull()
+                } else {
+                    null
+                }
+
+                if (DeviceDisconnectManager.isRemoteDisconnectSignal(response.code, preParsedObj)) {
+                    val reason = preParsedObj?.optString("message", "").orEmpty().trim()
+                        .ifBlank { "অ্যাডমিন প্যানেল থেকে এই ফোনটি ডিসকানেক্ট করা হয়েছে — অ্যাপ রিসেট ও ডেটা ক্লিয়ার করা হয়েছে।" }
+                    DeviceDisconnectManager.executeFullResetAndWipe(
+                        context = context,
+                        repository = repository,
+                        reasonMessage = reason,
+                        showNotification = true
+                    )
+                    return@withContext PollSyncResult(
+                        success = false,
+                        newNotificationsCount = 0,
+                        shouldAutoRefreshTasks = false,
+                        deviceDisconnected = true,
+                        statusMessage = reason
+                    )
+                }
+
                 if (!response.isSuccessful) {
                     val msg = if (response.code == 404) {
                         "PHP API পাওয়া যায়নি (404) — সেটআপ গাইড দেখুন"
@@ -87,7 +113,6 @@ class NotificationPoller(
                     )
                 }
 
-                val bodyString = response.body?.string().orEmpty().trim()
                 if (bodyString.isEmpty() || (!bodyString.startsWith("{") && !bodyString.startsWith("["))) {
                     val msg = "অবৈধ JSON রেসপন্স — PHP API ফরম্যাট যাচাই করুন"
                     repository.updateLastSync(now, msg)
@@ -102,7 +127,7 @@ class NotificationPoller(
                 val rootObj = if (bodyString.startsWith("[")) {
                     JSONObject().put("notifications", JSONArray(bodyString))
                 } else {
-                    JSONObject(bodyString)
+                    preParsedObj ?: JSONObject(bodyString)
                 }
 
                 // Strict multi-panel root guard
@@ -223,17 +248,15 @@ class NotificationPoller(
                     val isNew = repository.recordIncomingNotification(notif, deduplicate = true)
                     if (isNew) {
                         newCount++
-                        if (remoteControl.taskRefreshMode != TaskRefreshMode.OFF &&
-                            (notif.type == NotificationEventType.TASK_COMPLETED ||
-                                notif.type == NotificationEventType.TASK_ASSIGNED)
-                        ) {
+                        if (remoteControl.taskRefreshMode != TaskRefreshMode.OFF && notif.type.isTaskEvent) {
                             shouldRefresh = true
                         }
-                        if (showSystemNotifications && canDeliverAlerts) {
+                        if (showSystemNotifications && (canDeliverAlerts || (notif.type.isTaskEvent && remoteControl.notificationsEnabled))) {
                             NotificationHelper.showNotification(
-                                context,
-                                notif,
-                                remoteControl.alertDeliveryMode
+                                context = context,
+                                notification = notif,
+                                deliveryMode = remoteControl.alertDeliveryMode,
+                                currentRole = latestConfig.userRole
                             )
                         }
                     }
@@ -315,7 +338,9 @@ class NotificationPoller(
         val message = obj.optString("message").ifBlank { title }
         val defaultTarget = when (type) {
             NotificationEventType.ATTENDANCE_SUBMITTED -> config.attendanceUrl
-            NotificationEventType.TASK_ASSIGNED, NotificationEventType.TASK_COMPLETED -> config.tasksUrl
+            NotificationEventType.TASK_ASSIGNED,
+            NotificationEventType.TASK_UPDATED,
+            NotificationEventType.TASK_COMPLETED -> config.tasksUrl
             NotificationEventType.GPS_REQUEST, NotificationEventType.GENERAL -> config.baseUrl
         }
         val targetUrl = obj.optString("target_url").ifBlank { defaultTarget }
@@ -346,9 +371,21 @@ class NotificationPoller(
             return false
         }
 
-        val roleMatch = notif.targetRole.isBlank() ||
-            notif.targetRole == "all" ||
-            notif.targetRole.equals(config.userRole.key, ignoreCase = true)
+        // Strict policy: ONLY Admin and Manager phones may receive Attendance notifications
+        if (notif.type == NotificationEventType.ATTENDANCE_SUBMITTED &&
+            !config.userRole.canReceiveAttendanceAlerts
+        ) {
+            return false
+        }
+
+        val targetRoles = notif.targetRole
+            .split(",", "|", " ")
+            .map { it.trim().lowercase() }
+            .filter { it.isNotBlank() }
+
+        val roleMatch = targetRoles.isEmpty() ||
+            "all" in targetRoles ||
+            config.userRole.key.lowercase() in targetRoles
         if (!roleMatch) return false
 
         return notif.targetUserId.isBlank() ||

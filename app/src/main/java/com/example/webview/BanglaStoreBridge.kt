@@ -16,6 +16,7 @@ class BanglaStoreBridge(
     private val onIncomingEventCallback: (StoreNotification, Boolean) -> Unit,
     private val onRefreshRequestedCallback: (String?) -> Unit,
     private val onGpsRequestedCallback: (String) -> Unit = {},
+    private val onDeviceDisconnectedCallback: (String) -> Unit = {},
     private val onInnerScrollChangedCallback: (Boolean) -> Unit,
     private val locationSnapshotProvider: () -> LocationSnapshot,
     private val deviceInfoProvider: () -> String = { "{}" },
@@ -95,7 +96,7 @@ class BanglaStoreBridge(
             title = "নতুন অ্যাটেন্ডেন্স জমা হয়েছে",
             message = "$actor সফলভাবে অ্যাটেন্ডেন্স জমা দিয়েছেন$timePart।",
             actorName = actor,
-            targetRole = UserRole.ADMIN.key,
+            targetRole = "${UserRole.ADMIN.key},${UserRole.MANAGER.key}",
             targetUserId = "",
             targetUrl = targetUrl?.ifBlank { "" }.orEmpty(),
             timestampMillis = System.currentTimeMillis(),
@@ -119,9 +120,34 @@ class BanglaStoreBridge(
             title = "আপনার জন্য নতুন টাস্ক যোগ হয়েছে",
             message = "$titleText$byText",
             actorName = assignedBy.orEmpty(),
-            targetRole = UserRole.STAFF.key,
+            targetRole = "all",
             targetUserId = assigneeUserId.orEmpty(),
             targetUrl = targetUrl?.ifBlank { "" }.orEmpty(),
+            timestampMillis = System.currentTimeMillis(),
+            isRead = false
+        )
+        onIncomingEventCallback(notification, true)
+    }
+
+    @JavascriptInterface
+    fun onTaskUpdated(
+        taskId: String?,
+        taskTitle: String?,
+        status: String?,
+        updatedBy: String?
+    ) {
+        val actor = updatedBy?.ifBlank { "কর্মী" } ?: "কর্মী"
+        val titleText = taskTitle?.ifBlank { "একটি টাস্ক" } ?: "একটি টাস্ক"
+        val statusText = status?.ifBlank { "প্রসেসিং" } ?: "প্রসেসিং"
+        val notification = StoreNotification(
+            id = "proc_${taskId.orEmpty()}_${System.currentTimeMillis()}",
+            type = NotificationEventType.TASK_UPDATED,
+            title = "টাস্ক প্রসেস / আপডেট হয়েছে",
+            message = "$actor \"$titleText\" ($statusText) আপডেট করেছেন।",
+            actorName = actor,
+            targetRole = "all",
+            targetUserId = "",
+            targetUrl = "",
             timestampMillis = System.currentTimeMillis(),
             isRead = false
         )
@@ -140,7 +166,7 @@ class BanglaStoreBridge(
             id = "done_${taskId.orEmpty()}_${System.currentTimeMillis()}",
             type = NotificationEventType.TASK_COMPLETED,
             title = "টাস্ক কমপ্লিট হয়েছে",
-            message = "$actor \"$titleText\" সম্পন্ন করেছেন। পেজ অটোমেটিক রিফ্রেশ হচ্ছে।",
+            message = "$actor \"$titleText\" সম্পন্ন করেছেন।",
             actorName = actor,
             targetRole = "all",
             targetUserId = "",
@@ -160,6 +186,13 @@ class BanglaStoreBridge(
     fun onGpsRequested(requestId: String?) {
         val cleanId = requestId?.trim().orEmpty().ifBlank { "js_${System.currentTimeMillis()}" }
         onGpsRequestedCallback(cleanId)
+    }
+
+    @JavascriptInterface
+    fun onDeviceDisconnected(reason: String?) {
+        val cleanReason = reason?.trim().orEmpty()
+            .ifBlank { "অ্যাডমিন প্যানেল থেকে এই ফোনটি ডিসকানেক্ট করা হয়েছে — অ্যাপ রিসেট করা হয়েছে।" }
+        onDeviceDisconnectedCallback(cleanReason)
     }
 
     companion object {
@@ -280,14 +313,18 @@ class BanglaStoreBridge(
                             );
                         } else if (d.event === 'attendance_submitted') {
                             window.BanglaStoreBridge.onAttendanceSubmitted(p.staffName || '', p.timeText || '', p.targetUrl || '');
-                        } else if (d.event === 'task_assigned') {
+                        } else if (d.event === 'task_assigned' || d.event === 'task_added' || d.event === 'task_created') {
                             window.BanglaStoreBridge.onTaskAssigned(p.assigneeUserId || '', p.taskTitle || '', p.assignedBy || '', p.targetUrl || '');
-                        } else if (d.event === 'task_completed') {
+                        } else if (d.event === 'task_updated' || d.event === 'task_in_progress' || d.event === 'task_processing' || d.event === 'task_process') {
+                            window.BanglaStoreBridge.onTaskUpdated(p.taskId || '', p.taskTitle || '', p.status || 'in_progress', p.updatedBy || '');
+                        } else if (d.event === 'task_completed' || d.event === 'task_done') {
                             window.BanglaStoreBridge.onTaskCompleted(p.taskId || '', p.taskTitle || '', p.completedBy || '');
                         } else if (d.event === 'refresh') {
                             window.BanglaStoreBridge.requestRefresh(p.targetUrl || '');
                         } else if (d.event === 'gps_request') {
                             window.BanglaStoreBridge.onGpsRequested(p.requestId || p.request_id || '');
+                        } else if (d.event === 'device_disconnected' || d.event === 'force_reset' || d.event === 'unlink_device') {
+                            window.BanglaStoreBridge.onDeviceDisconnected(p.message || p.reason || '');
                         }
                     });
                 } catch (err) {}

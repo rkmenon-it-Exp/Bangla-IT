@@ -12,6 +12,7 @@ import com.example.data.StorePreferencesRepository
 import com.example.model.GpsCollectionMode
 import com.example.model.GpsUploadTrigger
 import com.example.model.LocationSnapshot
+import com.example.sync.DeviceDisconnectManager
 import com.example.sync.DeviceTelemetryHelper
 import com.example.sync.ImmediateSyncWorker
 import kotlinx.coroutines.Dispatchers
@@ -125,7 +126,24 @@ class LocationUploader(
         // Flush any previously queued offline points first if eligible
         flushPendingLocations(forceAll = trigger != GpsUploadTrigger.CONTINUOUS)
 
-        val uploadResult = postPayload(config.locationApiUrl, effectiveCookie, payload)
+        val uploadResult = postPayload(config.locationApiUrl, effectiveCookie, payload, deviceId)
+        if (uploadResult.disconnected) {
+            DeviceDisconnectManager.executeFullResetAndWipe(
+                context = context,
+                repository = repository,
+                reasonMessage = uploadResult.disconnectReason.ifBlank {
+                    "অ্যাডমিন প্যানেল থেকে এই ফোনটি ডিসকানেক্ট করা হয়েছে — অ্যাপ রিসেট করা হয়েছে।"
+                },
+                showNotification = true
+            )
+            return@withContext LocationSnapshot(
+                latitude = location.latitude,
+                longitude = location.longitude,
+                accuracyMeters = location.accuracy,
+                timestampMillis = now,
+                syncStatus = "অ্যাডমিন প্যানেল থেকে ডিসকানেক্ট"
+            )
+        }
         if (uploadResult.success) {
             repository.markGpsServerUploadTime(System.currentTimeMillis())
         }
@@ -217,13 +235,34 @@ class LocationUploader(
                     put("locations", arr)
                 }
                 val batchResult = postPayload(config.syncGpsApiUrl, cookie, batchPayload, deviceId)
-                if (batchResult.success) {
+                if (batchResult.disconnected) {
+                    DeviceDisconnectManager.executeFullResetAndWipe(
+                        context = context,
+                        repository = repository,
+                        reasonMessage = batchResult.disconnectReason.ifBlank {
+                            "অ্যাডমিন প্যানেল থেকে এই ফোনটি ডিসকানেক্ট করা হয়েছে — অ্যাপ রিসেট করা হয়েছে।"
+                        },
+                        showNotification = true
+                    )
+                    return@withLock 0
+                } else if (batchResult.success) {
                     uploadedCount = eligible.size
                     repository.markGpsServerUploadTime(System.currentTimeMillis())
                 } else if (batchResult.httpCode == 404 || batchResult.httpCode == 405) {
                     // Fallback to individual POSTs to {store_url}/api/location.php for older backends
                     for ((index, item) in eligible.withIndex()) {
                         val result = postPayload(config.locationApiUrl, cookie, item, deviceId)
+                        if (result.disconnected) {
+                            DeviceDisconnectManager.executeFullResetAndWipe(
+                                context = context,
+                                repository = repository,
+                                reasonMessage = result.disconnectReason.ifBlank {
+                                    "অ্যাডমিন প্যানেল থেকে এই ফোনটি ডিসকানেক্ট করা হয়েছে — অ্যাপ রিসেট করা হয়েছে।"
+                                },
+                                showNotification = true
+                            )
+                            return@withLock 0
+                        }
                         if (result.success || result.httpCode == 404) {
                             if (result.success) {
                                 uploadedCount++
@@ -334,14 +373,32 @@ class LocationUploader(
             }
 
             client.newCall(requestBuilder.build()).execute().use { response ->
-                UploadResponse(success = response.isSuccessful, httpCode = response.code)
+                val bodyStr = runCatching { response.body?.string().orEmpty().trim() }.getOrDefault("")
+                val json = if (bodyStr.startsWith("{")) {
+                    runCatching { JSONObject(bodyStr) }.getOrNull()
+                } else {
+                    null
+                }
+                val disconnected = DeviceDisconnectManager.isRemoteDisconnectSignal(response.code, json)
+                val reason = json?.optString("message", "").orEmpty().trim()
+                UploadResponse(
+                    success = response.isSuccessful && !disconnected,
+                    httpCode = response.code,
+                    disconnected = disconnected,
+                    disconnectReason = reason
+                )
             }
         } catch (_: Exception) {
             UploadResponse(success = false, httpCode = -1)
         }
     }
 
-    private data class UploadResponse(val success: Boolean, val httpCode: Int)
+    private data class UploadResponse(
+        val success: Boolean,
+        val httpCode: Int,
+        val disconnected: Boolean = false,
+        val disconnectReason: String = ""
+    )
 
     companion object {
         private val flushMutex = Mutex()

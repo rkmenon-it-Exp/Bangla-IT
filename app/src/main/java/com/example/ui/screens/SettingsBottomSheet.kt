@@ -362,11 +362,11 @@ fun SettingsBottomSheet(
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = "টাস্ক কমপ্লিট অটো-রিফ্রেশ",
+                            text = "টাস্ক পেজ অটো-রিফ্রেশ (শুধু টাস্ক)",
                             style = MaterialTheme.typography.bodyLarge
                         )
                         Text(
-                            text = "কাজ শেষ হলে টাস্ক পেজ নিজে থেকেই রিফ্রেশ হবে",
+                            text = "নতুন টাস্ক যোগ, প্রসেস বা কমপ্লিট হলে শুধু টাস্ক পেজ রিফ্রেশ হবে (পোর্টাল নয়)",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )

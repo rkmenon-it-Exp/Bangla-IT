@@ -118,6 +118,8 @@ import com.example.ui.screens.PortalWebViewScreen
 import com.example.ui.screens.QrCodeScannerDialog
 import com.example.ui.screens.SettingsBottomSheet
 import com.example.ui.screens.ShopBindingBottomSheet
+import com.example.ui.screens.UnboundWelcomeScreen
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
@@ -212,6 +214,24 @@ fun BanglaStoreApp(
         }
     }
 
+    LaunchedEffect(viewModel.remoteDisconnectEvents) {
+        viewModel.remoteDisconnectEvents.collect { reason ->
+            showSettingsSheet = false
+            showShopBindingSheet = false
+            showQrScannerDialog = false
+            showQuickUnlinkDialog = false
+            runCatching {
+                android.widget.Toast.makeText(
+                    context,
+                    reason,
+                    android.widget.Toast.LENGTH_LONG
+                ).show()
+            }
+            delay(450)
+            onRebootApp()
+        }
+    }
+
     // Wait for persisted DataStore config before mounting the WebView so a bound store
     // never loads the global portal URL on frame 1.
     if (!uiState.isConfigLoaded) {
@@ -282,6 +302,22 @@ fun BanglaStoreApp(
     BoxWithConstraints(modifier = modifier.fillMaxSize()) {
         val useRail = maxWidth >= 600.dp && bottomNavTabs.isNotEmpty()
 
+        if (!isStoreBound) {
+            UnboundWelcomeScreen(
+                onOpenUrlBinding = {
+                    viewModel.clearShopBindingError()
+                    showShopBindingSheet = true
+                },
+                onOpenQrScanner = {
+                    viewModel.clearShopBindingError()
+                    showQrScannerDialog = true
+                },
+                onOpenSettings = {
+                    showSettingsSheet = true
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+        } else {
         Scaffold(
             contentWindowInsets = WindowInsets.safeDrawing,
             snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
@@ -763,6 +799,7 @@ fun BanglaStoreApp(
                 }
             }
         }
+        } // end else (isStoreBound)
 
         if (isGpsBlocked) {
             MandatoryGpsBlockingOverlay(

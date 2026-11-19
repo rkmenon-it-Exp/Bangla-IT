@@ -8,8 +8,10 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.os.Build
+import android.media.AudioAttributes
+import android.media.RingtoneManager
 import android.net.Uri
+import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
@@ -18,12 +20,14 @@ import com.example.R
 import com.example.model.AlertDeliveryMode
 import com.example.model.NotificationEventType
 import com.example.model.StoreNotification
+import com.example.model.UserRole
 import java.util.Locale
 
 object NotificationHelper {
 
     const val CHANNEL_ATTENDANCE = "channel_admin_attendance"
     const val CHANNEL_TASKS = "channel_staff_tasks"
+    const val CHANNEL_TASKS_URGENT = "channel_staff_tasks_urgent_v2"
     const val CHANNEL_UPDATES = "channel_task_updates"
     const val CHANNEL_SILENT_UPDATES = "channel_silent_updates"
     const val CHANNEL_GPS_TRACKING = "channel_gps_tracking"
@@ -39,28 +43,47 @@ object NotificationHelper {
 
         val attendanceChannel = NotificationChannel(
             CHANNEL_ATTENDANCE,
-            "Admin Attendance Alerts (অ্যাটেন্ডেন্স)",
+            "Admin & Manager Attendance Alerts (অ্যাটেন্ডেন্স)",
             NotificationManager.IMPORTANCE_HIGH
         ).apply {
-            description = "Notifications sent to Admin when staff log in and submit attendance."
+            description = "Notifications sent strictly to Admin and Manager when staff submit attendance."
             enableVibration(true)
         }
 
         val taskChannel = NotificationChannel(
             CHANNEL_TASKS,
-            "Staff Task Alerts (নতুন টাস্ক)",
+            "Task Alerts (টাস্ক অ্যালার্ট)",
             NotificationManager.IMPORTANCE_HIGH
         ).apply {
-            description = "Notifications sent to staff when a new task is assigned."
+            description = "Notifications sent when a task is added, processed, or completed."
             enableVibration(true)
+        }
+
+        val alarmSoundUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+            ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
+        val alarmAudioAttrs = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_ALARM)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+            .build()
+
+        val urgentTaskChannel = NotificationChannel(
+            CHANNEL_TASKS_URGENT,
+            "Task Sound & Voice Alerts (সাইলেন্ট মোডেও সাউন্ড)",
+            NotificationManager.IMPORTANCE_HIGH
+        ).apply {
+            description = "High-priority task alerts with sound and voice even in Silent mode."
+            enableVibration(true)
+            vibrationPattern = longArrayOf(0L, 220L, 120L, 260L)
+            setSound(alarmSoundUri, alarmAudioAttrs)
+            setBypassDnd(true)
         }
 
         val updateChannel = NotificationChannel(
             CHANNEL_UPDATES,
-            "Task Completion & Refresh (কাজ সম্পন্ন)",
+            "General Updates (সাধারণ বিজ্ঞপ্তি)",
             NotificationManager.IMPORTANCE_DEFAULT
         ).apply {
-            description = "Updates when tasks are completed and pages auto-refresh."
+            description = "General panel status and disconnect alerts."
         }
 
         val gpsChannel = NotificationChannel(
@@ -85,12 +108,20 @@ object NotificationHelper {
             "App Software Updates (অ্যাপ আপডেট)",
             NotificationManager.IMPORTANCE_HIGH
         ).apply {
-            description = "Notifications when a new software version or APK is published on GitHub."
+            description = "Notifications when a new software version or APK is published."
             enableVibration(true)
         }
 
         manager.createNotificationChannels(
-            listOf(attendanceChannel, taskChannel, updateChannel, silentChannel, gpsChannel, appUpdateChannel)
+            listOf(
+                attendanceChannel,
+                taskChannel,
+                urgentTaskChannel,
+                updateChannel,
+                silentChannel,
+                gpsChannel,
+                appUpdateChannel
+            )
         )
     }
 
@@ -175,24 +206,35 @@ object NotificationHelper {
     fun showNotification(
         context: Context,
         notification: StoreNotification,
-        deliveryMode: AlertDeliveryMode = AlertDeliveryMode.POPUP_SOUND
+        deliveryMode: AlertDeliveryMode = AlertDeliveryMode.POPUP_SOUND,
+        currentRole: UserRole? = null
     ) {
-        if (deliveryMode == AlertDeliveryMode.OFF || deliveryMode == AlertDeliveryMode.INBOX_ONLY) {
+        // Strict role guard: ONLY Admin and Manager may ever receive Attendance notices on phone
+        if (notification.type == NotificationEventType.ATTENDANCE_SUBMITTED &&
+            currentRole != null &&
+            !currentRole.canReceiveAttendanceAlerts
+        ) {
             return
         }
+
+        val isTaskAlert = notification.type.isTaskEvent
+        if (!isTaskAlert && (deliveryMode == AlertDeliveryMode.OFF || deliveryMode == AlertDeliveryMode.INBOX_ONLY)) {
+            return
+        }
+
+        // For task events, ALWAYS play alarm-stream sound + spoken voice so it works in Silent mode too
+        if (isTaskAlert && deliveryMode != AlertDeliveryMode.OFF) {
+            TaskAlertAudioPlayer.playTaskSoundAndVoice(context, notification)
+        }
+
         ensureChannels(context)
         if (!hasNotificationPermission(context)) return
 
-        val channelId = if (deliveryMode == AlertDeliveryMode.SILENT) {
-            CHANNEL_SILENT_UPDATES
-        } else {
-            when (notification.type) {
-                NotificationEventType.ATTENDANCE_SUBMITTED -> CHANNEL_ATTENDANCE
-                NotificationEventType.TASK_ASSIGNED -> CHANNEL_TASKS
-                NotificationEventType.TASK_COMPLETED,
-                NotificationEventType.GPS_REQUEST,
-                NotificationEventType.GENERAL -> CHANNEL_UPDATES
-            }
+        val channelId = when {
+            isTaskAlert -> CHANNEL_TASKS_URGENT
+            deliveryMode == AlertDeliveryMode.SILENT -> CHANNEL_SILENT_UPDATES
+            notification.type == NotificationEventType.ATTENDANCE_SUBMITTED -> CHANNEL_ATTENDANCE
+            else -> CHANNEL_UPDATES
         }
 
         val tapIntent = Intent(context, MainActivity::class.java).apply {
@@ -217,11 +259,14 @@ object NotificationHelper {
             .setStyle(NotificationCompat.BigTextStyle().bigText(notification.message))
             .setContentIntent(pendingIntent)
             .setAutoCancel(true)
-            .setSilent(deliveryMode == AlertDeliveryMode.SILENT)
+            .setSilent(!isTaskAlert && deliveryMode == AlertDeliveryMode.SILENT)
+            .setCategory(
+                if (isTaskAlert) NotificationCompat.CATEGORY_ALARM else NotificationCompat.CATEGORY_MESSAGE
+            )
             .setPriority(
                 when {
+                    isTaskAlert -> NotificationCompat.PRIORITY_MAX
                     deliveryMode == AlertDeliveryMode.SILENT -> NotificationCompat.PRIORITY_LOW
-                    notification.type == NotificationEventType.TASK_COMPLETED -> NotificationCompat.PRIORITY_DEFAULT
                     else -> NotificationCompat.PRIORITY_HIGH
                 }
             )
@@ -231,6 +276,38 @@ object NotificationHelper {
                 notification.id.hashCode(),
                 builder.build()
             )
+        }
+    }
+
+    fun showRemoteDisconnectNotification(
+        context: Context,
+        reasonMessage: String = "অ্যাডমিন প্যানেল থেকে এই ফোনটি ডিসকানেক্ট করা হয়েছে — অ্যাপ রিসেট ও ডেটা ক্লিয়ার করা হয়েছে।"
+    ) {
+        ensureChannels(context)
+        if (!hasNotificationPermission(context)) return
+
+        val openAppIntent = Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            context,
+            9099,
+            openAppIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val builder = NotificationCompat.Builder(context, CHANNEL_APP_UPDATES)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setColor(0xFFC62828.toInt())
+            .setContentTitle("অ্যাডমিন প্যানেল থেকে ডিসকানেক্ট করা হয়েছে")
+            .setContentText(reasonMessage)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(reasonMessage))
+            .setContentIntent(pendingIntent)
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+
+        runCatching {
+            NotificationManagerCompat.from(context).notify(9099, builder.build())
         }
     }
 

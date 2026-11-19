@@ -406,6 +406,16 @@ class StorePreferencesRepository(private val context: Context) {
         }
     }
 
+    /**
+     * Full factory wipe of all DataStore preferences when the Admin Panel disconnects/revokes
+     * this phone or requests a remote reset.
+     */
+    suspend fun clearAllDataAndReset() {
+        context.banglaStoreDataStore.edit { prefs ->
+            prefs.clear()
+        }
+    }
+
     suspend fun getOrCreateUniqueDeviceId(): String {
         val hardwareId = DeviceTelemetryHelper.getDeviceId(context)
         if (hardwareId.isNotBlank()) return hardwareId

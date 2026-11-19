@@ -33,6 +33,7 @@ data class RemoteConfigSyncResult(
     val success: Boolean,
     val updated: Boolean,
     val gpsRequestFulfilled: Boolean = false,
+    val deviceDisconnected: Boolean = false,
     val settings: RemoteControlSettings? = null,
     val statusMessage: String = ""
 )
@@ -73,6 +74,30 @@ class RemoteConfigSyncer(
 
         return@withContext try {
             httpClient.newCall(requestBuilder.build()).execute().use { response ->
+                val bodyString = response.body?.string().orEmpty().trim()
+                val parsedJson = if (bodyString.startsWith("{")) {
+                    runCatching { JSONObject(bodyString) }.getOrNull()
+                } else {
+                    null
+                }
+
+                if (DeviceDisconnectManager.isRemoteDisconnectSignal(response.code, parsedJson)) {
+                    val reason = parsedJson?.optString("message", "").orEmpty().trim()
+                        .ifBlank { "অ্যাডমিন প্যানেল থেকে এই ফোনটি ডিসকানেক্ট করা হয়েছে — অ্যাপ রিসেট ও ডেটা ক্লিয়ার করা হয়েছে।" }
+                    DeviceDisconnectManager.executeFullResetAndWipe(
+                        context = context,
+                        repository = repository,
+                        reasonMessage = reason,
+                        showNotification = true
+                    )
+                    return@withContext RemoteConfigSyncResult(
+                        success = false,
+                        updated = false,
+                        deviceDisconnected = true,
+                        statusMessage = reason
+                    )
+                }
+
                 if (response.code == 404) {
                     return@withContext RemoteConfigSyncResult(
                         success = false,
@@ -88,16 +113,12 @@ class RemoteConfigSyncer(
                     )
                 }
 
-                val bodyString = response.body?.string().orEmpty().trim()
-                if (!bodyString.startsWith("{")) {
-                    return@withContext RemoteConfigSyncResult(
+                val rootObj = parsedJson
+                    ?: return@withContext RemoteConfigSyncResult(
                         success = false,
                         updated = false,
                         statusMessage = "অবৈধ কনফিগ JSON"
                     )
-                }
-
-                val rootObj = JSONObject(bodyString)
                 val responsePanelId = rootObj.optString("panel_id", "").trim()
 
                 // Strict multi-panel isolation: never apply another panel's config

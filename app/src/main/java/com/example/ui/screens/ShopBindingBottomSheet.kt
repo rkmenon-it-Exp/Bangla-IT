@@ -248,12 +248,12 @@ fun ShopBindingBottomSheet(
                             }
                         } else {
                             Text(
-                                text = "কোনো শপ যুক্ত নেই (Not Bound)",
+                                text = "অ্যাডমিন প্যানেলের সাথে যুক্ত নয়",
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.SemiBold
                             )
                             Text(
-                                text = "বর্তমানে ডিফল্ট পোর্টাল চালু আছে। নিচে আপনার শপের URL দিন অথবা QR কোড স্ক্যান করুন।",
+                                text = "অ্যাপটি ব্যবহার করতে নিচে শপের URL দিন অথবা QR কোড স্ক্যান করে কানেক্ট করুন।",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
