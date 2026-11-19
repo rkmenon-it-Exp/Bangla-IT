@@ -6,15 +6,11 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.location.LocationManager
-import android.net.Uri
 import android.os.Build
-import android.util.Log
+import android.webkit.CookieManager
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.example.ai.AiAssistantUiState
-import com.example.ai.AiChatMessage
-import com.example.ai.AiGenerationUiState
-import com.example.ai.GeminiAssistantService
+import com.example.BuildConfig
 import com.example.data.StorePreferencesRepository
 import com.example.location.LocationPermissionHelper
 import com.example.location.LocationSyncWorker
@@ -31,6 +27,7 @@ import com.example.model.NotificationEventType
 import com.example.model.PortalConfig
 import com.example.model.RemoteBottomTab
 import com.example.model.RemoteTopTab
+import com.example.model.ShopBindingUiState
 import com.example.model.StoreNotification
 import com.example.model.TaskRefreshMode
 import com.example.model.defaultBottomTabs
@@ -42,11 +39,12 @@ import com.example.sync.NetworkMonitor
 import com.example.sync.NotificationPoller
 import com.example.sync.NotificationSyncWorker
 import com.example.sync.RemoteConfigSyncer
+import com.example.sync.ShopHandshakeManager
+import com.example.sync.ShopHandshakeResult
 import com.example.webview.BanglaStoreBridge
 import com.example.webview.CachedPageSnapshot
 import com.example.webview.OfflinePageCache
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.TimeoutCancellationException
+import org.json.JSONObject
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -60,7 +58,6 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeout
 import java.util.concurrent.ConcurrentHashMap
 
 sealed interface WebViewCommand {
@@ -129,14 +126,17 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
     private val repository = StorePreferencesRepository(application)
     private val poller = NotificationPoller(application, repository)
     private val remoteConfigSyncer = RemoteConfigSyncer(application, repository)
+    private val shopHandshakeManager = ShopHandshakeManager(application, repository)
     private val locationUploader = LocationUploader(application, repository)
     private val gpsCapturer = OnDemandGpsCapturer(application, repository, locationUploader)
     private val networkMonitor = NetworkMonitor(application)
-    private val geminiAssistant = GeminiAssistantService()
     val offlinePageCache = OfflinePageCache(application)
 
-    private val _aiState = MutableStateFlow(AiAssistantUiState())
-    val aiState: StateFlow<AiAssistantUiState> = _aiState.asStateFlow()
+    @Volatile
+    private var cachedUniqueDeviceId: String = ""
+
+    private val _shopBindingState = MutableStateFlow(ShopBindingUiState())
+    val shopBindingState: StateFlow<ShopBindingUiState> = _shopBindingState.asStateFlow()
 
     private val _selectedWorkspaceId = MutableStateFlow(AppWorkspace.BANGLA_STORE.id)
     private val _openedWorkspaceIds = MutableStateFlow(setOf(AppWorkspace.BANGLA_STORE.id))
@@ -431,8 +431,21 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         onInnerScrollChangedCallback = { scrolled ->
             isWebInnerScrolled = scrolled
         },
-        locationSnapshotProvider = { uiState.value.locationSnapshot }
+        locationSnapshotProvider = { uiState.value.locationSnapshot },
+        deviceInfoProvider = { buildDeviceInfoJson() }
     )
+
+    private fun buildDeviceInfoJson(): String {
+        val cfg = uiState.value.config
+        return JSONObject().apply {
+            put("unique_device_id", cachedUniqueDeviceId)
+            put("device_model", Build.MODEL.orEmpty())
+            put("os_version", "Android ${Build.VERSION.RELEASE.orEmpty()}")
+            put("app_version", BuildConfig.VERSION_NAME)
+            put("store_code", cfg.storeCode)
+            put("panel_id", cfg.panelId)
+        }.toString()
+    }
 
     fun getSecondaryCommands(workspaceId: String): SharedFlow<WebViewCommand> {
         return getOrCreateSecondaryCommandFlow(workspaceId).asSharedFlow()
@@ -582,6 +595,7 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
             )
         }
         viewModelScope.launch {
+            cachedUniqueDeviceId = repository.getOrCreateUniqueDeviceId()
             if (LocationPermissionHelper.hasForegroundLocationPermission(application)) {
                 repository.ensureAndGetGpsScheduleAnchorTime()
             }
@@ -1127,117 +1141,6 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         }
     }
 
-    fun attachAiImage(uri: Uri?) {
-        if (uri == null) return
-        viewModelScope.launch {
-            val bitmap = geminiAssistant.decodeScaledBitmap(getApplication(), uri)
-            if (bitmap != null) {
-                _aiState.update { it.copy(attachedBitmap = bitmap) }
-            } else {
-                _snackbarMessages.tryEmit("ছবিটি পড়া যায়নি — অন্য ছবি বেছে নিন")
-            }
-        }
-    }
-
-    fun clearAiImage() {
-        _aiState.update { it.copy(attachedBitmap = null) }
-    }
-
-    fun sendAiPrompt(prompt: String) {
-        val cleanPrompt = prompt.trim()
-        if (cleanPrompt.isEmpty()) return
-        val currentState = _aiState.value
-        if (currentState.generationState is AiGenerationUiState.Loading ||
-            currentState.generationState is AiGenerationUiState.Streaming
-        ) {
-            return
-        }
-
-        val imageToSend = currentState.attachedBitmap
-        val userMsg = AiChatMessage(
-            id = "u_${System.currentTimeMillis()}",
-            isUser = true,
-            text = cleanPrompt,
-            hasImage = imageToSend != null
-        )
-
-        _aiState.update {
-            it.copy(
-                messages = it.messages + userMsg,
-                generationState = AiGenerationUiState.Loading,
-                attachedBitmap = null
-            )
-        }
-
-        viewModelScope.launch {
-            val accumulated = StringBuilder()
-            try {
-                withTimeout(60_000L) {
-                    geminiAssistant.sendMessageStream(cleanPrompt, imageToSend).collect { chunk ->
-                        accumulated.append(chunk)
-                        _aiState.update {
-                            it.copy(
-                                generationState = AiGenerationUiState.Streaming(accumulated.toString())
-                            )
-                        }
-                    }
-                }
-
-                val finalReply = accumulated.toString().trim()
-                if (finalReply.isNotEmpty()) {
-                    val botMsg = AiChatMessage(
-                        id = "m_${System.currentTimeMillis()}",
-                        isUser = false,
-                        text = finalReply
-                    )
-                    _aiState.update {
-                        it.copy(
-                            messages = it.messages + botMsg,
-                            generationState = AiGenerationUiState.Success
-                        )
-                    }
-                } else {
-                    _aiState.update {
-                        it.copy(
-                            generationState = AiGenerationUiState.Error(
-                                "Gemini থেকে কোনো উত্তর পাওয়া যায়নি। আবার চেষ্টা করুন।"
-                            )
-                        )
-                    }
-                }
-            } catch (e: TimeoutCancellationException) {
-                Log.e("BanglaStoreAi", "Gemini request timed out", e)
-                _aiState.update {
-                    it.copy(
-                        generationState = AiGenerationUiState.Error(
-                            "উত্তর তৈরি করতে সময় শেষ হয়েছে (৬০ সেকেন্ড)। অনুগ্রহ করে আবার চেষ্টা করুন।"
-                        )
-                    )
-                }
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                Log.e("BanglaStoreAi", "Gemini AI generation failed", e)
-                _aiState.update {
-                    it.copy(
-                        generationState = AiGenerationUiState.Error(
-                            e.localizedMessage ?: "Gemini AI অনুরোধ ব্যর্থ হয়েছে।"
-                        )
-                    )
-                }
-            }
-        }
-    }
-
-    fun clearAiChat() {
-        geminiAssistant.resetConversation()
-        _aiState.value = AiAssistantUiState()
-    }
-
-    fun notifyClipboardCopied() {
-        _snackbarMessages.tryEmit("টেক্সট কপি করা হয়েছে")
-    }
-
     fun handleLaunchIntent(intent: Intent?) {
         if (intent == null) return
         val targetUrl = intent.getStringExtra(NotificationHelper.EXTRA_TARGET_URL)
@@ -1286,6 +1189,85 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         return notif.targetUserId.isBlank() ||
             config.userId.isBlank() ||
             notif.targetUserId.equals(config.userId, ignoreCase = true)
+    }
+
+    fun clearShopBindingError() {
+        _shopBindingState.update { it.copy(errorMessage = null, statusMessage = null) }
+    }
+
+    fun bindShopUrl(rawUrl: String, onReadyToReboot: () -> Unit) {
+        if (_shopBindingState.value.isLoading) return
+        viewModelScope.launch {
+            _shopBindingState.value = ShopBindingUiState(
+                isLoading = true,
+                errorMessage = null,
+                statusMessage = "শপের সাথে সংযোগ ও ডেটা সিঙ্ক করা হচ্ছে..."
+            )
+            when (val result = shopHandshakeManager.performHandshake(rawUrl)) {
+                is ShopHandshakeResult.Failure -> {
+                    _shopBindingState.value = ShopBindingUiState(
+                        isLoading = false,
+                        errorMessage = result.errorMessageBn
+                    )
+                }
+                is ShopHandshakeResult.Success -> {
+                    _shopBindingState.value = ShopBindingUiState(
+                        isLoading = true,
+                        statusMessage = "বাইন্ডিং সংরক্ষণ ও অ্যাপ রিবুট করা হচ্ছে..."
+                    )
+                    // Wipe old tenant's WebView cookies & cached offline pages before saving new store
+                    runCatching {
+                        val cm = CookieManager.getInstance()
+                        cm.removeAllCookies(null)
+                        cm.flush()
+                    }
+                    offlinePageCache.clearAll()
+                    _cachedPages.value = emptyList()
+
+                    repository.applyShopBindingAndResetSession(
+                        boundStoreUrl = result.boundStoreUrl,
+                        storeCode = result.storeCode,
+                        storeName = result.storeName,
+                        appTitle = result.appTitle,
+                        logoUrl = result.logoUrl,
+                        themeColorHex = result.themeColorHex,
+                        panelId = result.panelId,
+                        baseUrl = result.baseUrl,
+                        attendanceUrl = result.attendanceUrl,
+                        tasksUrl = result.tasksUrl,
+                        notificationApiUrl = result.notificationApiUrl,
+                        locationApiUrl = result.locationApiUrl,
+                        syncGpsApiUrl = result.syncGpsApiUrl,
+                        configApiUrl = result.configApiUrl,
+                        remoteControl = result.remoteControl
+                    )
+                    delay(200)
+                    _shopBindingState.value = ShopBindingUiState(isLoading = false)
+                    onReadyToReboot()
+                }
+            }
+        }
+    }
+
+    fun resetShopBinding(onReadyToReboot: () -> Unit) {
+        if (_shopBindingState.value.isLoading) return
+        viewModelScope.launch {
+            _shopBindingState.value = ShopBindingUiState(
+                isLoading = true,
+                statusMessage = "ডিফল্ট বাংলা স্টোর রিসেট ও রিবুট হচ্ছে..."
+            )
+            runCatching {
+                val cm = CookieManager.getInstance()
+                cm.removeAllCookies(null)
+                cm.flush()
+            }
+            offlinePageCache.clearAll()
+            _cachedPages.value = emptyList()
+            repository.resetToDefaultStore()
+            delay(200)
+            _shopBindingState.value = ShopBindingUiState(isLoading = false)
+            onReadyToReboot()
+        }
     }
 
     override fun onCleared() {

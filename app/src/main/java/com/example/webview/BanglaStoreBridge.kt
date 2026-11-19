@@ -16,7 +16,8 @@ class BanglaStoreBridge(
     private val onRefreshRequestedCallback: (String?) -> Unit,
     private val onGpsRequestedCallback: (String) -> Unit = {},
     private val onInnerScrollChangedCallback: (Boolean) -> Unit,
-    private val locationSnapshotProvider: () -> LocationSnapshot
+    private val locationSnapshotProvider: () -> LocationSnapshot,
+    private val deviceInfoProvider: () -> String = { "{}" }
 ) {
 
     @JavascriptInterface
@@ -63,6 +64,9 @@ class BanglaStoreBridge(
             put("status", snap.syncStatus)
         }.toString()
     }
+
+    @JavascriptInterface
+    fun getDeviceInfoJson(): String = deviceInfoProvider()
 
     @JavascriptInterface
     fun onAttendanceSubmitted(

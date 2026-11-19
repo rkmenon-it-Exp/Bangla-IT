@@ -1,8 +1,13 @@
 package com.example.location
 
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.location.Location
+import android.os.BatteryManager
+import android.os.Build
 import android.webkit.CookieManager
+import com.example.BuildConfig
 import com.example.data.StorePreferencesRepository
 import com.example.model.GpsCollectionMode
 import com.example.model.GpsUploadTrigger
@@ -16,6 +21,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
@@ -38,6 +44,7 @@ class LocationUploader(
         trigger: GpsUploadTrigger = GpsUploadTrigger.HOURLY_SCHEDULE
     ): LocationSnapshot = withContext(Dispatchers.IO) {
         val config = repository.getConfigSnapshot()
+        val deviceId = repository.getOrCreateUniqueDeviceId()
         val now = if (location.time > 0L) location.time else System.currentTimeMillis()
         val payload = buildPayload(
             location = location,
@@ -47,6 +54,8 @@ class LocationUploader(
             timestampMillis = now,
             isLoggedIn = config.isLoggedIn || config.userId.isNotBlank(),
             panelId = config.panelId,
+            storeCode = config.storeCode,
+            deviceId = deviceId,
             userId = config.userId,
             userName = config.userName,
             roleKey = config.userRole.key
@@ -88,6 +97,7 @@ class LocationUploader(
 
         val now = if (location.time > 0L) location.time else System.currentTimeMillis()
         val effectiveCookie = resolveEffectiveCookie(config.baseUrl)
+        val deviceId = repository.getOrCreateUniqueDeviceId()
 
         val payload = buildPayload(
             location = location,
@@ -97,6 +107,8 @@ class LocationUploader(
             timestampMillis = now,
             isLoggedIn = config.isLoggedIn || config.userId.isNotBlank() || effectiveCookie.isNotBlank(),
             panelId = config.panelId,
+            storeCode = config.storeCode,
+            deviceId = deviceId,
             userId = config.userId,
             userName = config.userName,
             roleKey = config.userRole.key
@@ -144,8 +156,10 @@ class LocationUploader(
             if (pending.isEmpty()) return@withLock 0
 
             val config = repository.getConfigSnapshot()
+            val deviceId = repository.getOrCreateUniqueDeviceId()
             val cookie = resolveEffectiveCookie(config.baseUrl)
             val remaining = mutableListOf<JSONObject>()
+            val eligible = mutableListOf<JSONObject>()
             var uploadedCount = 0
 
             val now = System.currentTimeMillis()
@@ -156,7 +170,7 @@ class LocationUploader(
                 hourlyWindowElapsed ||
                 config.remoteControl.gpsMode == GpsCollectionMode.CONTINUOUS
 
-            for ((index, item) in pending.withIndex()) {
+            for (item in pending) {
                 val itemTrigger = item.optString("trigger", GpsUploadTrigger.HOURLY_SCHEDULE.key)
                 val canUploadThisItem = allowAllItems ||
                     itemTrigger.equals(GpsUploadTrigger.PANEL_REQUEST.key, ignoreCase = true)
@@ -169,20 +183,53 @@ class LocationUploader(
                 if (item.optString("panel_id").isBlank() && config.panelId.isNotBlank()) {
                     item.put("panel_id", config.panelId)
                 }
+                if (item.optString("store_code").isBlank() && config.storeCode.isNotBlank()) {
+                    item.put("store_code", config.storeCode)
+                }
                 if (item.optString("user_id").isBlank() && config.userId.isNotBlank()) {
                     item.put("user_id", config.userId)
                 }
-                val result = postPayload(config.locationApiUrl, cookie, item)
-                if (result.success || result.httpCode == 404) {
-                    if (result.success) {
-                        uploadedCount++
-                        repository.markGpsServerUploadTime(System.currentTimeMillis())
+                if (item.optString("device_id").isBlank()) {
+                    item.put("device_id", deviceId)
+                }
+                eligible.add(item)
+            }
+
+            if (eligible.isNotEmpty()) {
+                // Prefer Antigravity batch endpoint {store_url}/api/sync_gps.php first
+                val batchPayload = JSONObject().apply {
+                    put("panel_id", config.panelId)
+                    put("store_code", config.storeCode)
+                    put("user_id", config.userId)
+                    put("role", config.userRole.key)
+                    put("device_id", deviceId)
+                    val arr = JSONArray()
+                    eligible.forEach { arr.put(it) }
+                    put("locations", arr)
+                }
+                val batchResult = postPayload(config.syncGpsApiUrl, cookie, batchPayload, deviceId)
+                if (batchResult.success) {
+                    uploadedCount = eligible.size
+                    repository.markGpsServerUploadTime(System.currentTimeMillis())
+                } else if (batchResult.httpCode == 404 || batchResult.httpCode == 405) {
+                    // Fallback to individual POSTs to {store_url}/api/location.php for older backends
+                    for ((index, item) in eligible.withIndex()) {
+                        val result = postPayload(config.locationApiUrl, cookie, item, deviceId)
+                        if (result.success || result.httpCode == 404) {
+                            if (result.success) {
+                                uploadedCount++
+                                repository.markGpsServerUploadTime(System.currentTimeMillis())
+                            }
+                        } else {
+                            for (j in index until eligible.size) {
+                                remaining.add(eligible[j])
+                            }
+                            break
+                        }
                     }
                 } else {
-                    for (j in index until pending.size) {
-                        remaining.add(pending[j])
-                    }
-                    break
+                    // Transient network failure: keep all eligible items in queue
+                    remaining.addAll(eligible)
                 }
             }
 
@@ -207,12 +254,17 @@ class LocationUploader(
         timestampMillis: Long,
         isLoggedIn: Boolean,
         panelId: String,
+        storeCode: String,
+        deviceId: String,
         userId: String,
         userName: String,
         roleKey: String
     ): JSONObject {
+        val batteryPct = readBatteryLevelPercent()
         return JSONObject().apply {
             put("panel_id", panelId)
+            if (storeCode.isNotBlank()) put("store_code", storeCode)
+            put("device_id", deviceId)
             put("user_id", userId)
             put("user_name", userName)
             put("role", roleKey)
@@ -222,13 +274,24 @@ class LocationUploader(
             put("accuracy", location.accuracy.toDouble())
             put("speed", if (location.hasSpeed()) location.speed.toDouble() else 0.0)
             put("bearing", if (location.hasBearing()) location.bearing.toDouble() else 0.0)
+            put("battery_level", batteryPct)
             put("timestamp", timestampMillis)
             put("is_background", isBackground)
             put("trigger", trigger.key)
+            put("trigger_type", trigger.key)
             if (requestId.isNotBlank()) {
                 put("request_id", requestId.trim())
             }
         }
+    }
+
+    private fun readBatteryLevelPercent(): Int {
+        return runCatching {
+            val intent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            val level = intent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+            val scale = intent?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
+            if (level >= 0 && scale > 0) ((level * 100f) / scale).toInt().coerceIn(0, 100) else -1
+        }.getOrDefault(-1)
     }
 
     private suspend fun resolveEffectiveCookie(baseUrl: String): String {
@@ -245,14 +308,21 @@ class LocationUploader(
     private fun postPayload(
         url: String,
         cookie: String,
-        payload: JSONObject
+        payload: JSONObject,
+        deviceId: String = ""
     ): UploadResponse {
         return try {
             val requestBuilder = Request.Builder()
                 .url(url)
                 .header("Accept", "application/json")
+                .header("X-Device-Model", Build.MODEL.orEmpty())
+                .header("X-OS-Version", "Android ${Build.VERSION.RELEASE.orEmpty()}")
+                .header("X-App-Version", BuildConfig.VERSION_NAME)
                 .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
 
+            if (deviceId.isNotBlank()) {
+                requestBuilder.header("X-Device-Id", deviceId)
+            }
             if (cookie.isNotBlank()) {
                 requestBuilder.header("Cookie", cookie)
             }

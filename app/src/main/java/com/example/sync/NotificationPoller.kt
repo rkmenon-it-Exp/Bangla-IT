@@ -2,7 +2,9 @@ package com.example.sync
 
 import android.content.Context
 import android.net.Uri
+import android.os.Build
 import android.webkit.CookieManager
+import com.example.BuildConfig
 import com.example.data.StorePreferencesRepository
 import com.example.location.OnDemandGpsCapturer
 import com.example.model.AlertDeliveryMode
@@ -40,8 +42,10 @@ class NotificationPoller(
     suspend fun pollOnce(showSystemNotifications: Boolean = true): PollSyncResult = withContext(Dispatchers.IO) {
         val config = repository.getConfigSnapshot()
         val lastVersion = repository.getLastTaskVersion()
+        val lastSyncMillis = repository.getLastSyncTimeMillis()
+        val deviceId = repository.getOrCreateUniqueDeviceId()
 
-        val requestUrl = buildPollUrl(config, lastVersion)
+        val requestUrl = buildPollUrl(config, lastVersion, lastSyncMillis)
         val cookie = runCatching { CookieManager.getInstance().getCookie(config.baseUrl) }
             .getOrNull().orEmpty()
             .ifBlank { repository.getSessionCookie() }
@@ -49,6 +53,10 @@ class NotificationPoller(
         val requestBuilder = Request.Builder()
             .url(requestUrl)
             .header("Accept", "application/json")
+            .header("X-Device-Id", deviceId)
+            .header("X-Device-Model", Build.MODEL.orEmpty())
+            .header("X-OS-Version", "Android ${Build.VERSION.RELEASE.orEmpty()}")
+            .header("X-App-Version", BuildConfig.VERSION_NAME)
         if (cookie.isNotBlank()) {
             requestBuilder.header("Cookie", cookie)
         }
@@ -117,14 +125,22 @@ class NotificationPoller(
 
                 // If server bundles inline app_config inside notifications.php, apply it immediately
                 val bundledConfig = if (rootObj.has("app_config") || rootObj.has("config")) {
-                    RemoteConfigSyncer.parseRemoteControlSettings(rootObj)
+                    RemoteConfigSyncer.parseRemoteControlSettings(
+                        sourceObj = rootObj,
+                        fallbackBaseUrl = config.baseUrl,
+                        fallbackAttendanceUrl = config.attendanceUrl,
+                        fallbackTasksUrl = config.tasksUrl,
+                        fallbackPrimaryLabel = config.effectiveStoreDisplayName,
+                        includeDefaultIsp = !config.isCustomStoreBound
+                    )
                 } else {
                     null
                 }
                 if (bundledConfig != null) {
                     repository.saveRemoteControl(
                         bundledConfig,
-                        RemoteConfigSyncer.extractUrlOverrides(rootObj)
+                        RemoteConfigSyncer.extractUrlOverrides(rootObj, config.baseUrl),
+                        RemoteConfigSyncer.extractBrandingUpdate(rootObj, config.baseUrl)
                     )
                 }
                 val latestConfig = if (bundledConfig != null) {
@@ -233,7 +249,11 @@ class NotificationPoller(
         }
     }
 
-    private fun buildPollUrl(config: PortalConfig, lastTaskVersion: String): String {
+    private fun buildPollUrl(
+        config: PortalConfig,
+        lastTaskVersion: String,
+        lastSyncMillis: Long
+    ): String {
         return Uri.parse(config.notificationApiUrl)
             .buildUpon()
             .appendQueryParameter("role", config.userRole.key)
@@ -241,11 +261,17 @@ class NotificationPoller(
                 if (config.panelId.isNotBlank()) {
                     appendQueryParameter("panel_id", config.panelId)
                 }
+                if (config.storeCode.isNotBlank()) {
+                    appendQueryParameter("store_code", config.storeCode)
+                }
                 if (config.userId.isNotBlank()) {
                     appendQueryParameter("user_id", config.userId)
                 }
                 if (lastTaskVersion.isNotBlank()) {
                     appendQueryParameter("since_version", lastTaskVersion)
+                }
+                if (lastSyncMillis > 0L) {
+                    appendQueryParameter("since", (lastSyncMillis / 1000L).toString())
                 }
             }
             .build()

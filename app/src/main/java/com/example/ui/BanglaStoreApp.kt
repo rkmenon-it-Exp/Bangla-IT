@@ -41,7 +41,6 @@ import androidx.compose.material.icons.outlined.ReceiptLong
 import androidx.compose.material.icons.outlined.Router
 import androidx.compose.material.icons.outlined.Storefront
 import androidx.compose.material.icons.outlined.TaskAlt
-import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Dashboard
 import androidx.compose.material.icons.rounded.ErrorOutline
@@ -63,8 +62,6 @@ import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.Button
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FloatingActionButton
-import androidx.compose.material3.FloatingActionButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -104,31 +101,32 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import coil.compose.SubcomposeAsyncImage
 import com.example.R
 import com.example.location.LocationPermissionHelper
-import com.example.model.AppWorkspace
 import com.example.model.GpsCollectionMode
 import com.example.model.RemoteBottomTab
-import com.example.ui.screens.AiAssistantBottomSheet
 import com.example.ui.screens.AlertsInboxScreen
 import com.example.ui.screens.PortalWebViewScreen
 import com.example.ui.screens.SettingsBottomSheet
+import com.example.ui.screens.ShopBindingBottomSheet
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun BanglaStoreApp(
     viewModel: BanglaStoreViewModel,
+    onRebootApp: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
-    val aiState by viewModel.aiState.collectAsStateWithLifecycle()
+    val shopBindingState by viewModel.shopBindingState.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
     val coroutineScope = rememberCoroutineScope()
     var askedInitialPermissions by remember { mutableStateOf(false) }
     var showSettingsSheet by remember { mutableStateOf(false) }
-    var showAiAssistantSheet by remember { mutableStateOf(false) }
+    var showShopBindingSheet by remember { mutableStateOf(false) }
 
     val initialPermissionsLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
@@ -230,7 +228,7 @@ fun BanglaStoreApp(
     LaunchedEffect(isGpsBlocked) {
         if (isGpsBlocked) {
             showSettingsSheet = false
-            showAiAssistantSheet = false
+            showShopBindingSheet = false
         }
     }
 
@@ -256,22 +254,6 @@ fun BanglaStoreApp(
         Scaffold(
             contentWindowInsets = WindowInsets.safeDrawing,
             snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
-            floatingActionButton = {
-                if (!showAiAssistantSheet && !showSettingsSheet) {
-                    FloatingActionButton(
-                        onClick = { showAiAssistantSheet = true },
-                        containerColor = MaterialTheme.colorScheme.tertiary,
-                        contentColor = MaterialTheme.colorScheme.onTertiary,
-                        elevation = FloatingActionButtonDefaults.elevation(defaultElevation = 4.dp),
-                        modifier = Modifier.testTag("ai_assistant_fab")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.AutoAwesome,
-                            contentDescription = stringResource(R.string.cd_ai_assistant)
-                        )
-                    }
-                }
-            },
             topBar = {
                 TopAppBar(
                     expandedHeight = 72.dp,
@@ -280,28 +262,68 @@ fun BanglaStoreApp(
                         titleContentColor = MaterialTheme.colorScheme.onSurface
                     ),
                     navigationIcon = {
-                        if (activeCanGoBack) {
-                            IconButton(
-                                onClick = { viewModel.navigateActiveWebBack() },
-                                modifier = Modifier.testTag("top_back_button")
-                            ) {
-                                Icon(
-                                    imageVector = Icons.AutoMirrored.Rounded.ArrowBack,
-                                    contentDescription = stringResource(R.string.action_back)
-                                )
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.padding(start = 6.dp, end = 2.dp)
+                        ) {
+                            if (activeCanGoBack) {
+                                IconButton(
+                                    onClick = { viewModel.navigateActiveWebBack() },
+                                    modifier = Modifier.testTag("top_back_button")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.AutoMirrored.Rounded.ArrowBack,
+                                        contentDescription = stringResource(R.string.action_back)
+                                    )
+                                }
                             }
-                        } else {
                             Box(
+                                contentAlignment = Alignment.Center,
                                 modifier = Modifier
-                                    .padding(start = 12.dp, end = 4.dp)
-                                    .size(36.dp)
-                                    .clip(RoundedCornerShape(10.dp))
+                                    .size(48.dp)
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .clickable {
+                                        viewModel.clearShopBindingError()
+                                        showShopBindingSheet = true
+                                    }
+                                    .testTag("top_store_logo_button")
                             ) {
-                                Image(
-                                    painter = painterResource(id = R.drawable.ic_bangla_store_fg),
-                                    contentDescription = stringResource(R.string.cd_app_logo),
-                                    contentScale = ContentScale.Crop,
-                                    modifier = Modifier.fillMaxSize()
+                                Box(
+                                    modifier = Modifier
+                                        .size(36.dp)
+                                        .clip(RoundedCornerShape(10.dp))
+                                ) {
+                                    if (uiState.config.logoUrl.isNotBlank()) {
+                                        SubcomposeAsyncImage(
+                                            model = uiState.config.logoUrl,
+                                            contentDescription = stringResource(R.string.cd_shop_binding_logo),
+                                            contentScale = ContentScale.Crop,
+                                            error = {
+                                                Image(
+                                                    painter = painterResource(id = R.drawable.ic_bangla_store_fg),
+                                                    contentDescription = stringResource(R.string.cd_shop_binding_logo),
+                                                    contentScale = ContentScale.Crop,
+                                                    modifier = Modifier.fillMaxSize()
+                                                )
+                                            },
+                                            modifier = Modifier.fillMaxSize()
+                                        )
+                                    } else {
+                                        Image(
+                                            painter = painterResource(id = R.drawable.ic_bangla_store_fg),
+                                            contentDescription = stringResource(R.string.cd_shop_binding_logo),
+                                            contentScale = ContentScale.Crop,
+                                            modifier = Modifier.fillMaxSize()
+                                        )
+                                    }
+                                }
+                                Box(
+                                    modifier = Modifier
+                                        .align(Alignment.BottomEnd)
+                                        .padding(4.dp)
+                                        .size(10.dp)
+                                        .clip(CircleShape)
+                                        .background(MaterialTheme.colorScheme.primary)
                                 )
                             }
                         }
@@ -706,21 +728,18 @@ fun BanglaStoreApp(
         )
     }
 
-    if (showAiAssistantSheet) {
-        val aiWorkspace = if (activeWorkspace.id.equals(AppWorkspace.ISP.id, ignoreCase = true)) {
-            AppWorkspace.ISP
-        } else {
-            AppWorkspace.BANGLA_STORE
-        }
-        AiAssistantBottomSheet(
-            aiState = aiState,
-            activeWorkspace = aiWorkspace,
-            onAttachImageUri = viewModel::attachAiImage,
-            onClearImage = viewModel::clearAiImage,
-            onSendPrompt = viewModel::sendAiPrompt,
-            onClearChat = viewModel::clearAiChat,
-            onCopiedMessage = viewModel::notifyClipboardCopied,
-            onDismiss = { showAiAssistantSheet = false }
+    if (showShopBindingSheet) {
+        ShopBindingBottomSheet(
+            config = uiState.config,
+            bindingState = shopBindingState,
+            onBindShopUrl = { url ->
+                viewModel.bindShopUrl(url, onReadyToReboot = onRebootApp)
+            },
+            onResetToDefaultStore = {
+                viewModel.resetShopBinding(onReadyToReboot = onRebootApp)
+            },
+            onClearError = viewModel::clearShopBindingError,
+            onDismiss = { showShopBindingSheet = false }
         )
     }
 }

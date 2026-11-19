@@ -2,16 +2,22 @@ package com.example.sync
 
 import android.content.Context
 import android.net.Uri
+import android.os.Build
 import android.webkit.CookieManager
+import com.example.BuildConfig
 import com.example.data.StorePreferencesRepository
 import com.example.location.OnDemandGpsCapturer
 import com.example.model.AlertDeliveryMode
+import com.example.model.DEFAULT_ATTENDANCE_URL
+import com.example.model.DEFAULT_BASE_URL
+import com.example.model.DEFAULT_TASKS_URL
 import com.example.model.GpsCollectionMode
 import com.example.model.GpsUploadTrigger
 import com.example.model.PortalConfig
 import com.example.model.RemoteBottomTab
 import com.example.model.RemoteControlSettings
 import com.example.model.RemoteTopTab
+import com.example.model.StoreBrandingUpdate
 import com.example.model.TaskRefreshMode
 import com.example.model.defaultBottomTabs
 import com.example.model.defaultTopTabs
@@ -42,6 +48,7 @@ class RemoteConfigSyncer(
 
     suspend fun syncConfig(): RemoteConfigSyncResult = withContext(Dispatchers.IO) {
         val config = repository.getConfigSnapshot()
+        val deviceId = repository.getOrCreateUniqueDeviceId()
         val requestUrl = buildConfigUrl(config)
         val cookie = runCatching { CookieManager.getInstance().getCookie(config.baseUrl) }
             .getOrNull().orEmpty()
@@ -50,6 +57,10 @@ class RemoteConfigSyncer(
         val requestBuilder = Request.Builder()
             .url(requestUrl)
             .header("Accept", "application/json")
+            .header("X-Device-Id", deviceId)
+            .header("X-Device-Model", Build.MODEL.orEmpty())
+            .header("X-OS-Version", "Android ${Build.VERSION.RELEASE.orEmpty()}")
+            .header("X-App-Version", BuildConfig.VERSION_NAME)
         if (cookie.isNotBlank()) {
             requestBuilder.header("Cookie", cookie)
         }
@@ -104,15 +115,23 @@ class RemoteConfigSyncer(
                     )
                 }
 
-                val parsed = parseRemoteControlSettings(rootObj)
+                val parsed = parseRemoteControlSettings(
+                    sourceObj = rootObj,
+                    fallbackBaseUrl = config.baseUrl,
+                    fallbackAttendanceUrl = config.attendanceUrl,
+                    fallbackTasksUrl = config.tasksUrl,
+                    fallbackPrimaryLabel = config.effectiveStoreDisplayName,
+                    includeDefaultIsp = !config.isCustomStoreBound
+                )
                     ?: return@withContext RemoteConfigSyncResult(
                         success = false,
                         updated = false,
                         statusMessage = "কনফিগ পার্স করা যায়নি"
                     )
 
-                val urlOverrides = extractUrlOverrides(rootObj)
-                repository.saveRemoteControl(parsed, urlOverrides)
+                val urlOverrides = extractUrlOverrides(rootObj, config.baseUrl)
+                val brandingUpdate = extractBrandingUpdate(rootObj, config.baseUrl)
+                repository.saveRemoteControl(parsed, urlOverrides, brandingUpdate)
 
                 val latestConfig = repository.getConfigSnapshot()
                 val gpsFulfilled = handleRemoteGpsRequestObject(
@@ -147,6 +166,9 @@ class RemoteConfigSyncer(
             .apply {
                 if (config.panelId.isNotBlank()) {
                     appendQueryParameter("panel_id", config.panelId)
+                }
+                if (config.storeCode.isNotBlank()) {
+                    appendQueryParameter("store_code", config.storeCode)
                 }
                 if (config.userId.isNotBlank()) {
                     appendQueryParameter("user_id", config.userId)
@@ -216,7 +238,10 @@ class RemoteConfigSyncer(
             return snapshot != null
         }
 
-        fun extractUrlOverrides(rootObj: JSONObject): Map<String, String> {
+        fun extractUrlOverrides(
+            rootObj: JSONObject,
+            baseUrlForRelative: String = DEFAULT_BASE_URL
+        ): Map<String, String> {
             val urlsObj = rootObj.optJSONObject("urls")
                 ?: rootObj.optJSONObject("app_config")?.optJSONObject("urls")
                 ?: rootObj
@@ -227,38 +252,92 @@ class RemoteConfigSyncer(
                 "tasks_url",
                 "notification_api_url",
                 "location_api_url",
+                "sync_gps_api_url",
                 "config_api_url"
             ).forEach { key ->
                 val valStr = urlsObj.optString(key, "").trim()
                 if (valStr.startsWith("https://", ignoreCase = true) ||
-                    valStr.startsWith("http://", ignoreCase = true)
+                    valStr.startsWith("http://", ignoreCase = true) ||
+                    valStr.startsWith("/")
                 ) {
-                    overrides[key] = valStr
+                    overrides[key] = resolveUrlAgainstBase(valStr, baseUrlForRelative)
                 }
             }
             return overrides
         }
 
-        fun parseRemoteControlSettings(sourceObj: JSONObject): RemoteControlSettings? {
+        fun extractBrandingUpdate(
+            rootObj: JSONObject,
+            baseUrlForRelative: String = DEFAULT_BASE_URL
+        ): StoreBrandingUpdate? {
+            val obj = rootObj.optJSONObject("app_config")
+                ?: rootObj.optJSONObject("config")
+                ?: rootObj
+            val storeCode = obj.optString("store_code", rootObj.optString("store_code", "")).trim()
+            val storeName = obj.optString("store_name", rootObj.optString("store_name", "")).trim()
+            val appTitle = obj.optString("app_title", rootObj.optString("app_title", "")).trim()
+            val rawLogo = obj.optString("logo_url", rootObj.optString("logo_url", "")).trim()
+            val logoUrl = if (rawLogo.isNotBlank()) resolveUrlAgainstBase(rawLogo, baseUrlForRelative) else ""
+            val themeColor = obj.optString("theme_color", rootObj.optString("theme_color", "")).trim()
+
+            if (storeCode.isBlank() &&
+                storeName.isBlank() &&
+                appTitle.isBlank() &&
+                logoUrl.isBlank() &&
+                themeColor.isBlank()
+            ) {
+                return null
+            }
+            return StoreBrandingUpdate(
+                storeCode = storeCode.ifBlank { null },
+                storeName = storeName.ifBlank { null },
+                appTitle = appTitle.ifBlank { null },
+                logoUrl = logoUrl.ifBlank { null },
+                themeColorHex = themeColor.ifBlank { null }
+            )
+        }
+
+        fun parseRemoteControlSettings(
+            sourceObj: JSONObject,
+            fallbackBaseUrl: String = DEFAULT_BASE_URL,
+            fallbackAttendanceUrl: String = DEFAULT_ATTENDANCE_URL,
+            fallbackTasksUrl: String = DEFAULT_TASKS_URL,
+            fallbackPrimaryLabel: String = "বাংলা স্টোর",
+            includeDefaultIsp: Boolean = true
+        ): RemoteControlSettings? {
             val obj = sourceObj.optJSONObject("app_config")
                 ?: sourceObj.optJSONObject("config")
                 ?: sourceObj
 
             val hasAnyControlField = obj.has("top_tabs") ||
                 obj.has("bottom_tabs") ||
+                obj.has("bottom_nav") ||
                 obj.has("notification_settings") ||
                 obj.has("gps_settings") ||
                 obj.has("task_settings") ||
                 obj.has("config_version") ||
-                obj.has("panel_name")
+                obj.has("panel_name") ||
+                obj.has("store_name") ||
+                obj.has("app_title")
             if (!hasAnyControlField) return null
 
             val notifObj = obj.optJSONObject("notification_settings") ?: obj
             val gpsObj = obj.optJSONObject("gps_settings") ?: obj
             val taskObj = obj.optJSONObject("task_settings") ?: obj
 
-            val parsedTopTabs = parseTopTabs(obj.optJSONArray("top_tabs"))
-                .ifEmpty { defaultTopTabs() }
+            val defaultTop = defaultTopTabs(
+                primaryUrl = fallbackBaseUrl,
+                primaryLabel = fallbackPrimaryLabel,
+                includeDefaultIsp = includeDefaultIsp
+            )
+            val defaultBottom = defaultBottomTabs(
+                baseUrl = fallbackBaseUrl,
+                attendanceUrl = fallbackAttendanceUrl,
+                tasksUrl = fallbackTasksUrl
+            )
+
+            val parsedTopTabs = parseTopTabs(obj.optJSONArray("top_tabs"), fallbackBaseUrl)
+                .ifEmpty { defaultTop }
                 .let { list ->
                     if (list.any { it.isPrimaryStore }) {
                         list
@@ -269,8 +348,9 @@ class RemoteConfigSyncer(
                     }
                 }
 
-            val parsedBottomTabs = parseBottomTabs(obj.optJSONArray("bottom_tabs"))
-                .ifEmpty { defaultBottomTabs() }
+            val bottomJsonArray = obj.optJSONArray("bottom_tabs") ?: obj.optJSONArray("bottom_nav")
+            val parsedBottomTabs = parseBottomTabs(bottomJsonArray, fallbackBaseUrl)
+                .ifEmpty { defaultBottom }
 
             val allowedEvents = parseStringList(
                 notifObj.optJSONArray("allowed_event_types")
@@ -287,9 +367,12 @@ class RemoteConfigSyncer(
             )
             val defaultGpsInterval = if (gpsMode == GpsCollectionMode.ON_DEMAND_OR_HOURLY) 3600 else 30
 
+            val resolvedPanelName = obj.optString("panel_name", sourceObj.optString("panel_name", ""))
+                .ifBlank { obj.optString("store_name", sourceObj.optString("store_name", "")) }
+
             return RemoteControlSettings(
                 configVersion = obj.optString("config_version", sourceObj.optString("config_version", "")),
-                panelName = obj.optString("panel_name", sourceObj.optString("panel_name", "")),
+                panelName = resolvedPanelName,
                 topTabs = parsedTopTabs,
                 bottomTabs = parsedBottomTabs,
                 notificationsEnabled = notifObj.optBoolean("enabled", notifObj.optBoolean("notifications_enabled", true)),
@@ -322,49 +405,69 @@ class RemoteConfigSyncer(
             )
         }
 
-        private fun parseTopTabs(array: JSONArray?): List<RemoteTopTab> {
+        private fun parseTopTabs(
+            array: JSONArray?,
+            baseUrlForRelative: String
+        ): List<RemoteTopTab> {
             if (array == null || array.length() == 0) return emptyList()
             return buildList {
                 for (i in 0 until array.length()) {
                     val item = array.optJSONObject(i) ?: continue
                     val id = item.optString("id").trim()
+                        .ifBlank { item.optString("key").trim() }
+                        .ifBlank { "tab_$i" }
                     val label = item.optString("label").trim()
+                        .ifBlank { item.optString("title").trim() }
+                        .ifBlank { item.optString("name").trim() }
                     val url = item.optString("url").trim()
+                        .ifBlank { item.optString("link").trim() }
                     if (id.isBlank() || label.isBlank() || url.isBlank()) continue
                     add(
                         RemoteTopTab(
                             id = id,
                             label = label,
-                            url = normalizeUrl(url),
+                            url = resolveUrlAgainstBase(url, baseUrlForRelative),
                             icon = item.optString("icon", "storefront").trim().ifBlank { "storefront" },
                             roles = parseStringList(item.optJSONArray("roles")).ifEmpty { listOf("all") },
                             enabled = item.optBoolean("enabled", true),
-                            isPrimaryStore = item.optBoolean("is_primary_store", id == "bangla_store")
+                            isPrimaryStore = item.optBoolean(
+                                "is_primary_store",
+                                id == "bangla_store" || i == 0
+                            )
                         )
                     )
                 }
             }
         }
 
-        private fun parseBottomTabs(array: JSONArray?): List<RemoteBottomTab> {
+        private fun parseBottomTabs(
+            array: JSONArray?,
+            baseUrlForRelative: String
+        ): List<RemoteBottomTab> {
             if (array == null || array.length() == 0) return emptyList()
             return buildList {
                 for (i in 0 until array.length()) {
                     val item = array.optJSONObject(i) ?: continue
                     val id = item.optString("id").trim()
+                        .ifBlank { item.optString("key").trim() }
+                        .ifBlank { item.optString("route").trim() }
+                        .ifBlank { "nav_$i" }
                     val label = item.optString("label").trim()
+                        .ifBlank { item.optString("title").trim() }
+                        .ifBlank { item.optString("name").trim() }
                     if (id.isBlank() || label.isBlank()) continue
                     val type = item.optString("type", if (id == "alerts") "alerts" else "web")
                         .trim()
                         .lowercase()
                         .ifBlank { "web" }
                     val url = item.optString("url").trim()
+                        .ifBlank { item.optString("link").trim() }
                     if (type == "web" && url.isBlank()) continue
                     add(
                         RemoteBottomTab(
                             id = id,
                             label = label,
-                            url = if (url.isBlank()) "" else normalizeUrl(url),
+                            url = if (url.isBlank()) "" else resolveUrlAgainstBase(url, baseUrlForRelative),
                             icon = item.optString("icon", id).trim().ifBlank { id },
                             type = type,
                             roles = parseStringList(item.optJSONArray("roles")).ifEmpty { listOf("all") },
@@ -385,12 +488,22 @@ class RemoteConfigSyncer(
             }
         }
 
-        private fun normalizeUrl(raw: String): String {
+        fun resolveUrlAgainstBase(raw: String, baseUrl: String): String {
             val trimmed = raw.trim()
+            if (trimmed.isBlank()) return baseUrl
             return when {
                 trimmed.startsWith("https://", ignoreCase = true) -> trimmed
                 trimmed.startsWith("http://", ignoreCase = true) ->
                     "https://" + trimmed.removePrefix("http://").removePrefix("HTTP://")
+                trimmed.startsWith("/") -> {
+                    val parsedBase = runCatching { Uri.parse(baseUrl) }.getOrNull()
+                    val scheme = parsedBase?.scheme?.ifBlank { "https" } ?: "https"
+                    val authority = parsedBase?.encodedAuthority.orEmpty()
+                    if (authority.isNotBlank()) "$scheme://$authority$trimmed" else "${baseUrl.trimEnd('/')}$trimmed"
+                }
+                !trimmed.contains('.') || trimmed.contains(".php", ignoreCase = true) -> {
+                    "${baseUrl.trimEnd('/')}/${trimmed.trimStart('/')}"
+                }
                 else -> "https://$trimmed"
             }
         }

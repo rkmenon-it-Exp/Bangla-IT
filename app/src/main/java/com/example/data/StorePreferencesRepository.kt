@@ -18,6 +18,7 @@ import com.example.model.DEFAULT_BASE_URL
 import com.example.model.DEFAULT_CONFIG_API_URL
 import com.example.model.DEFAULT_LOCATION_API_URL
 import com.example.model.DEFAULT_NOTIFICATION_API_URL
+import com.example.model.DEFAULT_SYNC_GPS_API_URL
 import com.example.model.DEFAULT_TASKS_URL
 import com.example.model.GpsCollectionMode
 import com.example.model.LocationSnapshot
@@ -26,6 +27,7 @@ import com.example.model.PortalConfig
 import com.example.model.RemoteBottomTab
 import com.example.model.RemoteControlSettings
 import com.example.model.RemoteTopTab
+import com.example.model.StoreBrandingUpdate
 import com.example.model.StoreNotification
 import com.example.model.TaskRefreshMode
 import com.example.model.UserRole
@@ -36,6 +38,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.UUID
 
 private val Context.banglaStoreDataStore: DataStore<Preferences> by preferencesDataStore(
     name = "bangla_store_prefs"
@@ -49,7 +52,15 @@ class StorePreferencesRepository(private val context: Context) {
         val TASKS_URL = stringPreferencesKey("tasks_url")
         val NOTIFICATION_API_URL = stringPreferencesKey("notification_api_url")
         val LOCATION_API_URL = stringPreferencesKey("location_api_url")
+        val SYNC_GPS_API_URL = stringPreferencesKey("sync_gps_api_url")
         val CONFIG_API_URL = stringPreferencesKey("config_api_url")
+        val BOUND_STORE_URL = stringPreferencesKey("bound_store_url")
+        val STORE_CODE = stringPreferencesKey("store_code")
+        val STORE_NAME = stringPreferencesKey("store_name")
+        val APP_TITLE = stringPreferencesKey("app_title")
+        val LOGO_URL = stringPreferencesKey("logo_url")
+        val THEME_COLOR_HEX = stringPreferencesKey("theme_color_hex")
+        val DEVICE_UUID = stringPreferencesKey("device_uuid")
         val PANEL_ID = stringPreferencesKey("panel_id")
         val USER_ROLE = stringPreferencesKey("user_role")
         val USER_ID = stringPreferencesKey("user_id")
@@ -81,29 +92,83 @@ class StorePreferencesRepository(private val context: Context) {
     }
 
     val configFlow: Flow<PortalConfig> = context.banglaStoreDataStore.data.map { prefs ->
+        val boundStore = prefs[Keys.BOUND_STORE_URL].orEmpty().trim()
+        val effectiveBase = prefs[Keys.BASE_URL]?.ifBlank { null }
+            ?: boundStore.ifBlank { DEFAULT_BASE_URL }
         val storedAtt = prefs[Keys.ATTENDANCE_URL]
         val storedTasks = prefs[Keys.TASKS_URL]
         val legacyTab = AppTab.fromRoute(prefs[Keys.PREVIOUS_TAB])
         val storedTabId = prefs[Keys.PREVIOUS_TAB_ID]?.takeIf { it.isNotBlank() } ?: legacyTab.route
 
+        val fallbackAtt = if (boundStore.isNotBlank()) {
+            "${boundStore.trimEnd('/')}/dashboard.php?staff_view=attendance"
+        } else {
+            DEFAULT_ATTENDANCE_URL
+        }
+        val fallbackTasks = if (boundStore.isNotBlank()) {
+            "${boundStore.trimEnd('/')}/tasks.php"
+        } else {
+            DEFAULT_TASKS_URL
+        }
+        val fallbackNotifApi = if (boundStore.isNotBlank()) {
+            "${boundStore.trimEnd('/')}/api/notifications.php"
+        } else {
+            DEFAULT_NOTIFICATION_API_URL
+        }
+        val fallbackLocApi = if (boundStore.isNotBlank()) {
+            "${boundStore.trimEnd('/')}/api/location.php"
+        } else {
+            DEFAULT_LOCATION_API_URL
+        }
+        val fallbackSyncGpsApi = if (boundStore.isNotBlank()) {
+            "${boundStore.trimEnd('/')}/api/sync_gps.php"
+        } else {
+            DEFAULT_SYNC_GPS_API_URL
+        }
+        val fallbackConfigApi = if (boundStore.isNotBlank()) {
+            "${boundStore.trimEnd('/')}/api/app_config.php"
+        } else {
+            DEFAULT_CONFIG_API_URL
+        }
+
+        val storeDisplayName = prefs[Keys.APP_TITLE].orEmpty().ifBlank {
+            prefs[Keys.STORE_NAME].orEmpty().ifBlank { "বাংলা স্টোর" }
+        }
+        val parsedRemote = parseRemoteControlJson(
+            raw = prefs[Keys.REMOTE_CONTROL_JSON],
+            fallbackBaseUrl = effectiveBase,
+            fallbackAttendanceUrl = fallbackAtt,
+            fallbackTasksUrl = fallbackTasks,
+            fallbackPrimaryLabel = storeDisplayName,
+            includeDefaultIsp = boundStore.isBlank()
+        )
+
         PortalConfig(
-            baseUrl = prefs[Keys.BASE_URL]?.ifBlank { DEFAULT_BASE_URL } ?: DEFAULT_BASE_URL,
-            attendanceUrl = if (storedAtt.isNullOrBlank() || storedAtt == DEFAULT_BASE_URL) {
-                DEFAULT_ATTENDANCE_URL
+            baseUrl = effectiveBase,
+            attendanceUrl = if (storedAtt.isNullOrBlank() || (boundStore.isBlank() && storedAtt == DEFAULT_BASE_URL)) {
+                fallbackAtt
             } else {
                 storedAtt
             },
-            tasksUrl = if (storedTasks.isNullOrBlank() || storedTasks == DEFAULT_BASE_URL) {
-                DEFAULT_TASKS_URL
+            tasksUrl = if (storedTasks.isNullOrBlank() || (boundStore.isBlank() && storedTasks == DEFAULT_BASE_URL)) {
+                fallbackTasks
             } else {
                 storedTasks
             },
-            notificationApiUrl = prefs[Keys.NOTIFICATION_API_URL]?.ifBlank { DEFAULT_NOTIFICATION_API_URL }
-                ?: DEFAULT_NOTIFICATION_API_URL,
-            locationApiUrl = prefs[Keys.LOCATION_API_URL]?.ifBlank { DEFAULT_LOCATION_API_URL }
-                ?: DEFAULT_LOCATION_API_URL,
-            configApiUrl = prefs[Keys.CONFIG_API_URL]?.ifBlank { DEFAULT_CONFIG_API_URL }
-                ?: DEFAULT_CONFIG_API_URL,
+            notificationApiUrl = prefs[Keys.NOTIFICATION_API_URL]?.ifBlank { fallbackNotifApi }
+                ?: fallbackNotifApi,
+            locationApiUrl = prefs[Keys.LOCATION_API_URL]?.ifBlank { fallbackLocApi }
+                ?: fallbackLocApi,
+            syncGpsApiUrl = prefs[Keys.SYNC_GPS_API_URL]?.ifBlank { fallbackSyncGpsApi }
+                ?: fallbackSyncGpsApi,
+            configApiUrl = prefs[Keys.CONFIG_API_URL]?.ifBlank { fallbackConfigApi }
+                ?: fallbackConfigApi,
+            boundStoreUrl = boundStore,
+            storeCode = prefs[Keys.STORE_CODE].orEmpty(),
+            storeName = prefs[Keys.STORE_NAME].orEmpty(),
+            appTitle = prefs[Keys.APP_TITLE].orEmpty(),
+            logoUrl = prefs[Keys.LOGO_URL].orEmpty(),
+            themeColorHex = prefs[Keys.THEME_COLOR_HEX].orEmpty(),
             panelId = prefs[Keys.PANEL_ID].orEmpty(),
             userRole = UserRole.fromKey(prefs[Keys.USER_ROLE]),
             userId = prefs[Keys.USER_ID].orEmpty(),
@@ -115,7 +180,7 @@ class StorePreferencesRepository(private val context: Context) {
             autoRefreshOnTaskComplete = prefs[Keys.AUTO_REFRESH_ON_COMPLETE] ?: true,
             backgroundSyncEnabled = prefs[Keys.BACKGROUND_SYNC_ENABLED] ?: true,
             gpsTrackingEnabled = prefs[Keys.GPS_TRACKING_ENABLED] ?: true,
-            remoteControl = parseRemoteControlJson(prefs[Keys.REMOTE_CONTROL_JSON])
+            remoteControl = parsedRemote
         )
     }
 
@@ -168,6 +233,10 @@ class StorePreferencesRepository(private val context: Context) {
                 config.locationApiUrl,
                 DEFAULT_LOCATION_API_URL
             )
+            prefs[Keys.SYNC_GPS_API_URL] = sanitizeHttpsUrl(
+                config.syncGpsApiUrl,
+                DEFAULT_SYNC_GPS_API_URL
+            )
             prefs[Keys.CONFIG_API_URL] = sanitizeHttpsUrl(
                 config.configApiUrl,
                 DEFAULT_CONFIG_API_URL
@@ -184,7 +253,8 @@ class StorePreferencesRepository(private val context: Context) {
 
     suspend fun saveRemoteControl(
         settings: RemoteControlSettings,
-        urlOverrides: Map<String, String> = emptyMap()
+        urlOverrides: Map<String, String> = emptyMap(),
+        brandingUpdate: StoreBrandingUpdate? = null
     ) {
         context.banglaStoreDataStore.edit { prefs ->
             prefs[Keys.REMOTE_CONTROL_JSON] = serializeRemoteControlJson(settings)
@@ -199,10 +269,135 @@ class StorePreferencesRepository(private val context: Context) {
             urlOverrides["location_api_url"]?.let {
                 prefs[Keys.LOCATION_API_URL] = sanitizeHttpsUrl(it, DEFAULT_LOCATION_API_URL)
             }
+            urlOverrides["sync_gps_api_url"]?.let {
+                prefs[Keys.SYNC_GPS_API_URL] = sanitizeHttpsUrl(it, DEFAULT_SYNC_GPS_API_URL)
+            }
             urlOverrides["config_api_url"]?.let {
                 prefs[Keys.CONFIG_API_URL] = sanitizeHttpsUrl(it, DEFAULT_CONFIG_API_URL)
             }
+            if (brandingUpdate != null) {
+                brandingUpdate.storeCode?.takeIf { it.isNotBlank() }?.let { prefs[Keys.STORE_CODE] = it.trim() }
+                brandingUpdate.storeName?.takeIf { it.isNotBlank() }?.let { prefs[Keys.STORE_NAME] = it.trim() }
+                brandingUpdate.appTitle?.takeIf { it.isNotBlank() }?.let { prefs[Keys.APP_TITLE] = it.trim() }
+                brandingUpdate.logoUrl?.takeIf { it.isNotBlank() }?.let {
+                    prefs[Keys.LOGO_URL] = sanitizeHttpsUrl(it, "")
+                }
+                brandingUpdate.themeColorHex?.takeIf { it.isNotBlank() }?.let {
+                    prefs[Keys.THEME_COLOR_HEX] = it.trim()
+                }
+            }
         }
+    }
+
+    suspend fun applyShopBindingAndResetSession(
+        boundStoreUrl: String,
+        storeCode: String,
+        storeName: String,
+        appTitle: String,
+        logoUrl: String,
+        themeColorHex: String,
+        panelId: String,
+        baseUrl: String,
+        attendanceUrl: String,
+        tasksUrl: String,
+        notificationApiUrl: String,
+        locationApiUrl: String,
+        syncGpsApiUrl: String,
+        configApiUrl: String,
+        remoteControl: RemoteControlSettings
+    ) {
+        val cleanBound = sanitizeHttpsUrl(boundStoreUrl, DEFAULT_BASE_URL).trimEnd('/')
+        context.banglaStoreDataStore.edit { prefs ->
+            // Complete tenant reset so previous shop's session/notifications/GPS queue never cross over
+            prefs[Keys.IS_LOGGED_IN] = false
+            prefs[Keys.USER_ID] = ""
+            prefs[Keys.USER_NAME] = ""
+            prefs[Keys.SESSION_COOKIE] = ""
+            prefs[Keys.NOTIFICATIONS_JSON] = "[]"
+            prefs[Keys.SEEN_EVENT_IDS] = emptySet()
+            prefs[Keys.LAST_TASK_VERSION] = ""
+            prefs[Keys.PENDING_LOCATIONS_JSON] = "[]"
+            prefs[Keys.LAST_FULFILLED_GPS_REQUEST_ID] = ""
+            prefs[Keys.LAST_GPS_UPLOAD_TIME] = 0L
+            prefs[Keys.LAST_GPS_SERVER_UPLOAD_TIME] = 0L
+            prefs[Keys.PREVIOUS_TAB] = AppTab.PORTAL.route
+            prefs[Keys.PREVIOUS_TAB_ID] = AppTab.PORTAL.route
+            prefs[Keys.PREVIOUS_URL] = ""
+
+            // Persist new bound shop metadata & endpoints
+            prefs[Keys.BOUND_STORE_URL] = cleanBound
+            prefs[Keys.STORE_CODE] = storeCode.trim()
+            prefs[Keys.STORE_NAME] = storeName.trim()
+            prefs[Keys.APP_TITLE] = appTitle.trim()
+            prefs[Keys.LOGO_URL] = if (logoUrl.isBlank()) "" else sanitizeHttpsUrl(logoUrl, "")
+            prefs[Keys.THEME_COLOR_HEX] = themeColorHex.trim()
+            prefs[Keys.PANEL_ID] = panelId.trim().ifBlank { storeCode.trim() }
+
+            prefs[Keys.BASE_URL] = sanitizeHttpsUrl(baseUrl, cleanBound)
+            prefs[Keys.ATTENDANCE_URL] = sanitizeHttpsUrl(attendanceUrl, "$cleanBound/dashboard.php?staff_view=attendance")
+            prefs[Keys.TASKS_URL] = sanitizeHttpsUrl(tasksUrl, "$cleanBound/tasks.php")
+            prefs[Keys.NOTIFICATION_API_URL] = sanitizeHttpsUrl(notificationApiUrl, "$cleanBound/api/notifications.php")
+            prefs[Keys.LOCATION_API_URL] = sanitizeHttpsUrl(locationApiUrl, "$cleanBound/api/location.php")
+            prefs[Keys.SYNC_GPS_API_URL] = sanitizeHttpsUrl(syncGpsApiUrl, "$cleanBound/api/sync_gps.php")
+            prefs[Keys.CONFIG_API_URL] = sanitizeHttpsUrl(configApiUrl, "$cleanBound/api/app_config.php")
+            prefs[Keys.REMOTE_CONTROL_JSON] = serializeRemoteControlJson(remoteControl)
+            prefs[Keys.LAST_SYNC_TIME] = System.currentTimeMillis()
+            prefs[Keys.LAST_SYNC_STATUS] = "নতুন শপ বাইন্ডিং সম্পন্ন (${storeName.ifBlank { storeCode.ifBlank { cleanBound } }})"
+        }
+    }
+
+    suspend fun resetToDefaultStore() {
+        context.banglaStoreDataStore.edit { prefs ->
+            prefs[Keys.BOUND_STORE_URL] = ""
+            prefs[Keys.STORE_CODE] = ""
+            prefs[Keys.STORE_NAME] = ""
+            prefs[Keys.APP_TITLE] = ""
+            prefs[Keys.LOGO_URL] = ""
+            prefs[Keys.THEME_COLOR_HEX] = ""
+            prefs[Keys.PANEL_ID] = ""
+            prefs[Keys.BASE_URL] = DEFAULT_BASE_URL
+            prefs[Keys.ATTENDANCE_URL] = DEFAULT_ATTENDANCE_URL
+            prefs[Keys.TASKS_URL] = DEFAULT_TASKS_URL
+            prefs[Keys.NOTIFICATION_API_URL] = DEFAULT_NOTIFICATION_API_URL
+            prefs[Keys.LOCATION_API_URL] = DEFAULT_LOCATION_API_URL
+            prefs[Keys.SYNC_GPS_API_URL] = DEFAULT_SYNC_GPS_API_URL
+            prefs[Keys.CONFIG_API_URL] = DEFAULT_CONFIG_API_URL
+            prefs[Keys.REMOTE_CONTROL_JSON] = ""
+            prefs[Keys.IS_LOGGED_IN] = false
+            prefs[Keys.USER_ID] = ""
+            prefs[Keys.USER_NAME] = ""
+            prefs[Keys.SESSION_COOKIE] = ""
+            prefs[Keys.NOTIFICATIONS_JSON] = "[]"
+            prefs[Keys.SEEN_EVENT_IDS] = emptySet()
+            prefs[Keys.LAST_TASK_VERSION] = ""
+            prefs[Keys.PENDING_LOCATIONS_JSON] = "[]"
+            prefs[Keys.LAST_FULFILLED_GPS_REQUEST_ID] = ""
+            prefs[Keys.LAST_GPS_UPLOAD_TIME] = 0L
+            prefs[Keys.LAST_GPS_SERVER_UPLOAD_TIME] = 0L
+            prefs[Keys.PREVIOUS_TAB] = AppTab.PORTAL.route
+            prefs[Keys.PREVIOUS_TAB_ID] = AppTab.PORTAL.route
+            prefs[Keys.PREVIOUS_URL] = ""
+            prefs[Keys.LAST_SYNC_TIME] = 0L
+            prefs[Keys.LAST_SYNC_STATUS] = "ডিফল্ট বাংলা স্টোর রিসেট হয়েছে"
+        }
+    }
+
+    suspend fun getOrCreateUniqueDeviceId(): String {
+        var deviceId = ""
+        context.banglaStoreDataStore.edit { prefs ->
+            val existing = prefs[Keys.DEVICE_UUID].orEmpty().trim()
+            if (existing.isNotBlank()) {
+                deviceId = existing
+            } else {
+                deviceId = UUID.randomUUID().toString()
+                prefs[Keys.DEVICE_UUID] = deviceId
+            }
+        }
+        return deviceId
+    }
+
+    suspend fun getLastSyncTimeMillis(): Long {
+        return context.banglaStoreDataStore.data.first()[Keys.LAST_SYNC_TIME] ?: 0L
     }
 
     suspend fun updateSessionFromWeb(
@@ -278,17 +473,22 @@ class StorePreferencesRepository(private val context: Context) {
 
     suspend fun clearLoginSession() {
         context.banglaStoreDataStore.edit { prefs ->
+            val isBound = prefs[Keys.BOUND_STORE_URL].orEmpty().isNotBlank()
             prefs[Keys.IS_LOGGED_IN] = false
             prefs[Keys.USER_ID] = ""
             prefs[Keys.USER_NAME] = ""
-            prefs[Keys.PANEL_ID] = ""
             prefs[Keys.SESSION_COOKIE] = ""
             prefs[Keys.NOTIFICATIONS_JSON] = "[]"
             prefs[Keys.SEEN_EVENT_IDS] = emptySet()
             prefs[Keys.LAST_TASK_VERSION] = ""
-            prefs[Keys.REMOTE_CONTROL_JSON] = ""
             prefs[Keys.LAST_FULFILLED_GPS_REQUEST_ID] = ""
             prefs[Keys.LAST_GPS_UPLOAD_TIME] = 0L
+            if (isBound) {
+                prefs[Keys.PANEL_ID] = prefs[Keys.STORE_CODE].orEmpty()
+            } else {
+                prefs[Keys.PANEL_ID] = ""
+                prefs[Keys.REMOTE_CONTROL_JSON] = ""
+            }
         }
     }
 
@@ -565,8 +765,27 @@ class StorePreferencesRepository(private val context: Context) {
         return array.toString()
     }
 
-    private fun parseRemoteControlJson(raw: String?): RemoteControlSettings {
-        if (raw.isNullOrBlank()) return RemoteControlSettings()
+    private fun parseRemoteControlJson(
+        raw: String?,
+        fallbackBaseUrl: String = DEFAULT_BASE_URL,
+        fallbackAttendanceUrl: String = DEFAULT_ATTENDANCE_URL,
+        fallbackTasksUrl: String = DEFAULT_TASKS_URL,
+        fallbackPrimaryLabel: String = "বাংলা স্টোর",
+        includeDefaultIsp: Boolean = true
+    ): RemoteControlSettings {
+        val defaultTop = defaultTopTabs(
+            primaryUrl = fallbackBaseUrl,
+            primaryLabel = fallbackPrimaryLabel,
+            includeDefaultIsp = includeDefaultIsp
+        )
+        val defaultBottom = defaultBottomTabs(
+            baseUrl = fallbackBaseUrl,
+            attendanceUrl = fallbackAttendanceUrl,
+            tasksUrl = fallbackTasksUrl
+        )
+        if (raw.isNullOrBlank()) {
+            return RemoteControlSettings(topTabs = defaultTop, bottomTabs = defaultBottom)
+        }
         return runCatching {
             val obj = JSONObject(raw)
             val topArr = obj.optJSONArray("top_tabs")
@@ -591,12 +810,12 @@ class StorePreferencesRepository(private val context: Context) {
                             )
                         }
                     }
-                }.ifEmpty { defaultTopTabs() }
+                }.ifEmpty { defaultTop }
             } else {
-                defaultTopTabs()
+                defaultTop
             }
 
-            val bottomArr = obj.optJSONArray("bottom_tabs")
+            val bottomArr = obj.optJSONArray("bottom_tabs") ?: obj.optJSONArray("bottom_nav")
             val bottomTabs = if (bottomArr != null && bottomArr.length() > 0) {
                 buildList {
                     for (i in 0 until bottomArr.length()) {
@@ -617,9 +836,9 @@ class StorePreferencesRepository(private val context: Context) {
                             )
                         }
                     }
-                }.ifEmpty { defaultBottomTabs() }
+                }.ifEmpty { defaultBottom }
             } else {
-                defaultBottomTabs()
+                defaultBottom
             }
 
             RemoteControlSettings(
@@ -644,7 +863,7 @@ class StorePreferencesRepository(private val context: Context) {
                 refreshCooldownSeconds = obj.optInt("refresh_cooldown_seconds", 20).coerceIn(5, 3600),
                 refreshOnlyOnTabs = jsonArrayToList(obj.optJSONArray("refresh_only_on_tabs"))
             )
-        }.getOrDefault(RemoteControlSettings())
+        }.getOrDefault(RemoteControlSettings(topTabs = defaultTop, bottomTabs = defaultBottom))
     }
 
     private fun serializeRemoteControlJson(settings: RemoteControlSettings): String {

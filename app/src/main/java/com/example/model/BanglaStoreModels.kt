@@ -178,13 +178,34 @@ data class LocationSnapshot(
         get() = timestampMillis > 0L && (latitude != 0.0 || longitude != 0.0)
 }
 
+data class StoreBrandingUpdate(
+    val storeCode: String? = null,
+    val storeName: String? = null,
+    val appTitle: String? = null,
+    val logoUrl: String? = null,
+    val themeColorHex: String? = null
+)
+
+data class ShopBindingUiState(
+    val isLoading: Boolean = false,
+    val errorMessage: String? = null,
+    val statusMessage: String? = null
+)
+
 data class PortalConfig(
     val baseUrl: String = DEFAULT_BASE_URL,
     val attendanceUrl: String = DEFAULT_ATTENDANCE_URL,
     val tasksUrl: String = DEFAULT_TASKS_URL,
     val notificationApiUrl: String = DEFAULT_NOTIFICATION_API_URL,
     val locationApiUrl: String = DEFAULT_LOCATION_API_URL,
+    val syncGpsApiUrl: String = DEFAULT_SYNC_GPS_API_URL,
     val configApiUrl: String = DEFAULT_CONFIG_API_URL,
+    val boundStoreUrl: String = "",
+    val storeCode: String = "",
+    val storeName: String = "",
+    val appTitle: String = "",
+    val logoUrl: String = "",
+    val themeColorHex: String = "",
     val panelId: String = "",
     val userRole: UserRole = UserRole.ADMIN,
     val userId: String = "",
@@ -197,7 +218,13 @@ data class PortalConfig(
     val backgroundSyncEnabled: Boolean = true,
     val gpsTrackingEnabled: Boolean = true,
     val remoteControl: RemoteControlSettings = RemoteControlSettings()
-)
+) {
+    val isCustomStoreBound: Boolean
+        get() = boundStoreUrl.isNotBlank()
+
+    val effectiveStoreDisplayName: String
+        get() = appTitle.ifBlank { storeName.ifBlank { remoteControl.panelName.ifBlank { "বাংলা স্টোর" } } }
+}
 
 enum class AppTab(
     val route: String,
@@ -236,32 +263,46 @@ enum class AlertFilter(val labelBn: String) {
     TASKS("টাস্ক ও আপডেট")
 }
 
-fun defaultTopTabs(): List<RemoteTopTab> = listOf(
-    RemoteTopTab(
-        id = AppWorkspace.BANGLA_STORE.id,
-        label = "বাংলা স্টোর",
-        url = DEFAULT_BASE_URL,
-        icon = "storefront",
-        roles = listOf("all"),
-        enabled = true,
-        isPrimaryStore = true
-    ),
-    RemoteTopTab(
-        id = AppWorkspace.ISP.id,
-        label = "ISP",
-        url = DEFAULT_ISP_URL,
-        icon = "router",
-        roles = listOf("all"),
-        enabled = true,
-        isPrimaryStore = false
+fun defaultTopTabs(
+    primaryUrl: String = DEFAULT_BASE_URL,
+    primaryLabel: String = "বাংলা স্টোর",
+    includeDefaultIsp: Boolean = true
+): List<RemoteTopTab> = buildList {
+    add(
+        RemoteTopTab(
+            id = AppWorkspace.BANGLA_STORE.id,
+            label = primaryLabel.ifBlank { "বাংলা স্টোর" },
+            url = primaryUrl.ifBlank { DEFAULT_BASE_URL },
+            icon = "storefront",
+            roles = listOf("all"),
+            enabled = true,
+            isPrimaryStore = true
+        )
     )
-)
+    if (includeDefaultIsp) {
+        add(
+            RemoteTopTab(
+                id = AppWorkspace.ISP.id,
+                label = "ISP",
+                url = DEFAULT_ISP_URL,
+                icon = "router",
+                roles = listOf("all"),
+                enabled = true,
+                isPrimaryStore = false
+            )
+        )
+    }
+}
 
-fun defaultBottomTabs(): List<RemoteBottomTab> = listOf(
+fun defaultBottomTabs(
+    baseUrl: String = DEFAULT_BASE_URL,
+    attendanceUrl: String = DEFAULT_ATTENDANCE_URL,
+    tasksUrl: String = DEFAULT_TASKS_URL
+): List<RemoteBottomTab> = listOf(
     RemoteBottomTab(
         id = AppTab.PORTAL.route,
         label = "পোর্টাল",
-        url = DEFAULT_BASE_URL,
+        url = baseUrl.ifBlank { DEFAULT_BASE_URL },
         icon = "storefront",
         type = "web",
         roles = listOf("all"),
@@ -270,7 +311,7 @@ fun defaultBottomTabs(): List<RemoteBottomTab> = listOf(
     RemoteBottomTab(
         id = AppTab.ATTENDANCE.route,
         label = "অ্যাটেন্ডেন্স",
-        url = DEFAULT_ATTENDANCE_URL,
+        url = attendanceUrl.ifBlank { DEFAULT_ATTENDANCE_URL },
         icon = "attendance",
         type = "web",
         roles = listOf("all"),
@@ -279,7 +320,7 @@ fun defaultBottomTabs(): List<RemoteBottomTab> = listOf(
     RemoteBottomTab(
         id = AppTab.TASKS.route,
         label = "টাস্ক",
-        url = DEFAULT_TASKS_URL,
+        url = tasksUrl.ifBlank { DEFAULT_TASKS_URL },
         icon = "tasks",
         type = "web",
         roles = listOf("all"),
@@ -302,4 +343,5 @@ const val DEFAULT_TASKS_URL = "https://banglait.net/shop/tasks.php"
 const val DEFAULT_ISP_URL = "https://admin.banglait.net/"
 const val DEFAULT_NOTIFICATION_API_URL = "https://banglait.net/shop/api/notifications.php"
 const val DEFAULT_LOCATION_API_URL = "https://banglait.net/shop/api/location.php"
+const val DEFAULT_SYNC_GPS_API_URL = "https://banglait.net/shop/api/sync_gps.php"
 const val DEFAULT_CONFIG_API_URL = "https://banglait.net/shop/api/app_config.php"

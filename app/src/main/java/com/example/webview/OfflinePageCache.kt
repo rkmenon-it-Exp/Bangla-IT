@@ -60,6 +60,12 @@ class OfflinePageCache(context: Context) {
         }.getOrDefault(emptyList())
     }
 
+    fun clearAll() {
+        runCatching {
+            cacheDir.listFiles()?.forEach { it.delete() }
+        }
+    }
+
     private fun readSnapshotFile(file: File): CachedPageSnapshot? {
         if (!file.exists()) return null
         return runCatching {
