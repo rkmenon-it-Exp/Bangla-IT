@@ -23,6 +23,7 @@ class ImmediateSyncWorker(
 ) : CoroutineWorker(appContext, workerParams) {
 
     override suspend fun doWork(): Result {
+        NetworkClientProvider.onNetworkChanged(applicationContext)
         val repository = StorePreferencesRepository(applicationContext)
         val initial = repository.getConfigSnapshot()
         if (!initial.isCustomStoreBound) {

@@ -138,7 +138,6 @@ fun BanglaStoreApp(
     var showSettingsSheet by remember { mutableStateOf(false) }
     var showShopBindingSheet by remember { mutableStateOf(false) }
     var showQrScannerDialog by remember { mutableStateOf(false) }
-    var showQuickUnlinkDialog by remember { mutableStateOf(false) }
 
     val initialPermissionsLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
@@ -219,7 +218,6 @@ fun BanglaStoreApp(
             showSettingsSheet = false
             showShopBindingSheet = false
             showQrScannerDialog = false
-            showQuickUnlinkDialog = false
             runCatching {
                 android.widget.Toast.makeText(
                     context,
@@ -344,23 +342,14 @@ fun BanglaStoreApp(
                                     )
                                 }
                             }
+                            // Once bound to an Admin Panel, the store logo is strictly display-only:
+                            // binding/unlinking is locked and can only be revoked from the Admin Panel.
                             Box(
                                 contentAlignment = Alignment.Center,
                                 modifier = Modifier
                                     .size(48.dp)
                                     .clip(RoundedCornerShape(12.dp))
-                                    .combinedClickable(
-                                        onClick = {
-                                            viewModel.clearShopBindingError()
-                                            showShopBindingSheet = true
-                                        },
-                                        onLongClick = {
-                                            if (isStoreBound) {
-                                                showQuickUnlinkDialog = true
-                                            }
-                                        }
-                                    )
-                                    .testTag("top_store_logo_button")
+                                    .testTag("top_store_logo_badge")
                             ) {
                                 Box(
                                     modifier = Modifier
@@ -532,11 +521,16 @@ fun BanglaStoreApp(
                                                 append(panelBadge)
                                             }
                                             append(" • ")
+                                            val onlineLabel = if (uiState.networkTransportLabel.isNotBlank()) {
+                                                uiState.networkTransportLabel
+                                            } else {
+                                                "Online"
+                                            }
                                             append(
                                                 when {
                                                     !uiState.isOnline -> "Offline"
-                                                    gpsActive -> "Online • GPS"
-                                                    else -> "Online"
+                                                    gpsActive -> "$onlineLabel • GPS"
+                                                    else -> onlineLabel
                                                 }
                                             )
                                             if (uiState.pendingSyncCount > 0) {
@@ -885,13 +879,11 @@ fun BanglaStoreApp(
             lastSyncTimeMillis = uiState.lastSyncTimeMillis,
             lastSyncStatus = uiState.lastSyncStatus,
             onOpenQrScanner = {
-                showSettingsSheet = false
-                viewModel.clearShopBindingError()
-                showQrScannerDialog = true
-            },
-            onUnlinkStore = {
-                showSettingsSheet = false
-                viewModel.resetShopBinding(onReadyToReboot = onRebootApp)
+                if (!isStoreBound) {
+                    showSettingsSheet = false
+                    viewModel.clearShopBindingError()
+                    showQrScannerDialog = true
+                }
             },
             onRequestNotificationPermission = {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -920,7 +912,7 @@ fun BanglaStoreApp(
         )
     }
 
-    if (showShopBindingSheet) {
+    if (showShopBindingSheet && !isStoreBound) {
         ShopBindingBottomSheet(
             config = uiState.config,
             bindingState = shopBindingState,
@@ -932,15 +924,12 @@ fun BanglaStoreApp(
                 viewModel.clearShopBindingError()
                 showQrScannerDialog = true
             },
-            onResetToDefaultStore = {
-                viewModel.resetShopBinding(onReadyToReboot = onRebootApp)
-            },
             onClearError = viewModel::clearShopBindingError,
             onDismiss = { showShopBindingSheet = false }
         )
     }
 
-    if (showQrScannerDialog) {
+    if (showQrScannerDialog && !isStoreBound) {
         QrCodeScannerDialog(
             bindingState = shopBindingState,
             onQrCodeScanned = { rawQr ->
@@ -950,45 +939,6 @@ fun BanglaStoreApp(
             onDismiss = {
                 showQrScannerDialog = false
                 viewModel.clearShopBindingError()
-            }
-        )
-    }
-
-    if (showQuickUnlinkDialog && isStoreBound) {
-        AlertDialog(
-            onDismissRequest = { showQuickUnlinkDialog = false },
-            icon = {
-                Icon(
-                    imageVector = Icons.Rounded.LinkOff,
-                    contentDescription = null,
-                    tint = MaterialTheme.colorScheme.error
-                )
-            },
-            title = { Text("শপ আনলিংক করবেন?") },
-            text = {
-                Text(
-                    "\"${uiState.config.effectiveStoreDisplayName}\" থেকে আনলিংক করলে বর্তমান সেশন, ব্যাকগ্রাউন্ড GPS ও শপের সব কনফিগ মুছে গিয়ে অ্যাপটি রিবুট হবে।"
-                )
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        showQuickUnlinkDialog = false
-                        viewModel.resetShopBinding(onReadyToReboot = onRebootApp)
-                    },
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.error,
-                        contentColor = MaterialTheme.colorScheme.onError
-                    ),
-                    modifier = Modifier.testTag("quick_confirm_unlink_button")
-                ) {
-                    Text("আনলিংক ও রিবুট করুন")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showQuickUnlinkDialog = false }) {
-                    Text("বাতিল")
-                }
             }
         )
     }

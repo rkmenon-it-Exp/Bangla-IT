@@ -26,33 +26,26 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Clear
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.Link
-import androidx.compose.material.icons.rounded.LinkOff
 import androidx.compose.material.icons.rounded.QrCodeScanner
 import androidx.compose.material.icons.rounded.Storefront
 import androidx.compose.material.icons.rounded.Verified
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -79,7 +72,6 @@ fun ShopBindingBottomSheet(
     bindingState: ShopBindingUiState,
     onBindShopUrl: (String) -> Unit,
     onOpenQrScanner: () -> Unit,
-    onResetToDefaultStore: () -> Unit,
     onClearError: () -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -87,7 +79,6 @@ fun ShopBindingBottomSheet(
     var shopUrlInput by rememberSaveable(config.boundStoreUrl) {
         mutableStateOf(config.boundStoreUrl.ifBlank { "" })
     }
-    var showUnlinkConfirmDialog by remember { mutableStateOf(false) }
 
     ModalBottomSheet(
         onDismissRequest = {
@@ -393,69 +384,7 @@ fun ShopBindingBottomSheet(
                 Text("কিউআর কোড স্ক্যান করুন (Scan QR Code)")
             }
 
-            if (config.isCustomStoreBound) {
-                HorizontalDivider()
-                OutlinedButton(
-                    onClick = { showUnlinkConfirmDialog = true },
-                    enabled = !bindingState.isLoading,
-                    colors = ButtonDefaults.outlinedButtonColors(
-                        contentColor = MaterialTheme.colorScheme.error
-                    ),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(min = 48.dp)
-                        .testTag("shop_binding_reset_button")
-                ) {
-                    Icon(
-                        imageVector = Icons.Rounded.LinkOff,
-                        contentDescription = null,
-                        modifier = Modifier.size(18.dp)
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text("শপ আনলিংক ও রিবুট করুন (Unlink Store)")
-                }
-            }
-
             Spacer(modifier = Modifier.height(6.dp))
         }
-    }
-
-    if (showUnlinkConfirmDialog) {
-        AlertDialog(
-            onDismissRequest = { showUnlinkConfirmDialog = false },
-            icon = {
-                Icon(
-                    imageVector = Icons.Rounded.LinkOff,
-                    contentDescription = null,
-                    tint = MaterialTheme.colorScheme.error
-                )
-            },
-            title = { Text("শপ আনলিংক করবেন?") },
-            text = {
-                Text(
-                    "\"${config.effectiveStoreDisplayName}\" থেকে অ্যাপটি আনলিংক করলে বর্তমান লগইন সেশন, ব্যাকগ্রাউন্ড GPS ও শপের ডেটা মুছে যাবে এবং অ্যাপটি রিবুট হয়ে সাধারণ ডিফল্ট পোর্টালে ফিরে যাবে।"
-                )
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        showUnlinkConfirmDialog = false
-                        onResetToDefaultStore()
-                    },
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.error,
-                        contentColor = MaterialTheme.colorScheme.onError
-                    ),
-                    modifier = Modifier.testTag("shop_binding_confirm_unlink_button")
-                ) {
-                    Text("আনলিংক ও রিবুট করুন")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showUnlinkConfirmDialog = false }) {
-                    Text("বাতিল")
-                }
-            }
-        )
     }
 }

@@ -10,6 +10,9 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
 import androidx.compose.runtime.getValue
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import coil.Coil
+import coil.ImageLoader
+import com.example.sync.NetworkClientProvider
 import com.example.ui.BanglaStoreApp
 import com.example.ui.BanglaStoreViewModel
 import com.example.ui.theme.BanglaStoreTheme
@@ -21,6 +24,12 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        Coil.setImageLoader(
+            ImageLoader.Builder(applicationContext)
+                .okHttpClient { NetworkClientProvider.getClient(applicationContext) }
+                .crossfade(true)
+                .build()
+        )
         viewModel.handleLaunchIntent(intent)
         setContent {
             val uiState by viewModel.uiState.collectAsStateWithLifecycle()
@@ -41,7 +50,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        viewModel.refreshDeviceAndPermissionState()
+        viewModel.onAppForegrounded()
     }
 
     override fun onStop() {

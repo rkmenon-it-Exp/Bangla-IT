@@ -21,11 +21,6 @@ object AppUpdateChecker {
     private const val GITHUB_REPO_NAME = "Bangla-IT"
     private const val LATEST_RELEASE_API = "https://api.github.com/repos/$GITHUB_REPO_OWNER/$GITHUB_REPO_NAME/releases/latest"
 
-    private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(10, TimeUnit.SECONDS)
-        .build()
-
     suspend fun checkForUpdate(context: Context, triggerNotification: Boolean = true): AppUpdateInfo = withContext(Dispatchers.IO) {
         try {
             val currentVersion = runCatching {
@@ -39,7 +34,7 @@ object AppUpdateChecker {
                 .header("User-Agent", "BanglaStore-AndroidApp")
                 .build()
 
-            httpClient.newCall(request).execute().use { response ->
+            NetworkClientProvider.getClient(context).newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
                     return@withContext AppUpdateInfo(hasUpdate = false)
                 }

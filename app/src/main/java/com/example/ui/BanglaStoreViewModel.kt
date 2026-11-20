@@ -38,7 +38,10 @@ import com.example.sync.AppUpdateChecker
 import com.example.sync.DeviceDisconnectManager
 import com.example.sync.DeviceTelemetryHelper
 import com.example.sync.ImmediateSyncWorker
+import com.example.sync.NetworkClientProvider
 import com.example.sync.NetworkMonitor
+import com.example.sync.NetworkSnapshot
+import com.example.sync.NetworkSwitchReason
 import com.example.sync.NotificationPoller
 import com.example.sync.NotificationSyncWorker
 import com.example.sync.RemoteConfigSyncer
@@ -56,6 +59,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
@@ -66,6 +70,10 @@ import java.util.concurrent.ConcurrentHashMap
 sealed interface WebViewCommand {
     data class LoadUrl(val url: String) : WebViewCommand
     data class LoadHtmlSnapshot(val baseUrl: String, val html: String) : WebViewCommand
+    data class RecoverFromNetworkSwitch(
+        val transportLabel: String,
+        val forceHardReload: Boolean = false
+    ) : WebViewCommand
     data object Reload : WebViewCommand
     data object GoBack : WebViewCommand
 }
@@ -97,6 +105,7 @@ data class BanglaStoreUiState(
     val webError: String? = null,
     val secondaryWebStates: Map<String, SecondaryWebState> = emptyMap(),
     val isOnline: Boolean = true,
+    val networkTransportLabel: String = "",
     val pendingSyncCount: Int = 0,
     val isShowingOfflineCache: Boolean = false,
     val cachedPages: List<CachedPageSnapshot> = emptyList(),
@@ -179,7 +188,6 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
     )
     private val _showBackgroundLocationDialog = MutableStateFlow(false)
     private var promptedBackgroundThisSession = false
-    private var wasOnline = networkMonitor.isOnline.value
     private var sawLoginPage = false
     private var pendingPostLoginRedirect = false
     private var lastAutoRefreshMillis = 0L
@@ -248,7 +256,7 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         repository.syncStatusFlow,
         repository.locationFlow,
         repository.pendingSyncCountFlow,
-        networkMonitor.isOnline,
+        networkMonitor.networkState,
         _isSyncing,
         _hasNotificationPermission,
         _hasForegroundLocation,
@@ -265,7 +273,8 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
         val syncPair = values[4] as Pair<Long, String>
         val location = values[5] as LocationSnapshot
         val pendingCount = values[6] as Int
-        val isOnline = values[7] as Boolean
+        val networkSnapshot = values[7] as NetworkSnapshot
+        val isOnline = networkSnapshot.isOnline
         val isSyncing = values[8] as Boolean
         val hasNotifPerm = values[9] as Boolean
         val hasFgLoc = values[10] as Boolean
@@ -353,6 +362,7 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
             webError = webAgg.webError,
             secondaryWebStates = webAgg.secondaryStates,
             isOnline = isOnline,
+            networkTransportLabel = if (isOnline) networkSnapshot.transport.label else "",
             pendingSyncCount = pendingCount,
             isShowingOfflineCache = webAgg.isShowingOfflineCache,
             cachedPages = webAgg.cachedPages,
@@ -758,63 +768,120 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     private fun observeNetworkRecovery() {
+        // 1. Arm background reconnect worker whenever device drops offline
         viewModelScope.launch {
-            networkMonitor.isOnline
-                .collect { online ->
+            networkMonitor.isOnline.collect { online ->
+                if (!online) {
+                    NetworkClientProvider.onNetworkChanged(getApplication())
                     val currentCfg = repository.getConfigSnapshot()
-                    if (!online) {
-                        wasOnline = false
-                        if (currentCfg.isCustomStoreBound) {
-                            ImmediateSyncWorker.scheduleOnReconnect(getApplication())
-                        }
-                    } else if (!wasOnline) {
-                        wasOnline = true
-                        val hadOfflineUi = _webError.value != null || _isShowingOfflineCache.value
-                        _webError.value = null
-                        _isShowingOfflineCache.value = false
-                        if (hadOfflineUi) {
-                            _webViewCommands.tryEmit(WebViewCommand.Reload)
-                        }
-                        _secondaryWebStates.value.forEach { (wsId, state) ->
-                            if (state.webError != null || state.isShowingOfflineCache) {
-                                updateSecondaryState(wsId) {
-                                    it.copy(webError = null, isShowingOfflineCache = false)
-                                }
-                                getOrCreateSecondaryCommandFlow(wsId).tryEmit(WebViewCommand.Reload)
-                            }
-                        }
+                    if (currentCfg.isCustomStoreBound) {
+                        ImmediateSyncWorker.scheduleOnReconnect(getApplication())
+                    }
+                }
+            }
+        }
 
-                        if (!currentCfg.isCustomStoreBound) {
-                            _snackbarMessages.tryEmit("ইন্টারনেট সংযোগ ফিরে এসেছে")
-                            return@collect
+        // 2. React immediately to EVERY network transition:
+        //    Wi-Fi <-> Mobile Data, VPN switch, IP/DNS/LinkProperties change, or offline -> online.
+        //    collectLatest with a brief settle delay coalesces rapid handoff jitter cleanly.
+        viewModelScope.launch {
+            networkMonitor.networkSwitchEvents.collectLatest { event ->
+                val appCtx = getApplication<Application>()
+                NetworkClientProvider.onNetworkChanged(appCtx)
+
+                // Wait briefly for Android's routing table & DNS servers on the new interface to settle
+                val settleDelayMs = when (event.reason) {
+                    NetworkSwitchReason.TRANSPORT_CHANGED -> 550L
+                    NetworkSwitchReason.IP_OR_DNS_CHANGED -> 400L
+                    NetworkSwitchReason.RECONNECTED -> 450L
+                    NetworkSwitchReason.VALIDATED_READY -> 250L
+                }
+                delay(settleDelayMs)
+
+                if (!networkMonitor.isOnline.value) return@collectLatest
+
+                // Flush again after settle so any socket opened mid-handoff is evicted cleanly
+                NetworkClientProvider.onNetworkChanged(appCtx)
+
+                val transportLabel = event.snapshot.transport.label
+                val primaryNeedsReload = _webError.value != null ||
+                    _isShowingOfflineCache.value ||
+                    _pageProgress.value in 1..99
+                if (_webError.value != null || _isShowingOfflineCache.value) {
+                    _webError.value = null
+                    _isShowingOfflineCache.value = false
+                }
+                _webViewCommands.tryEmit(
+                    WebViewCommand.RecoverFromNetworkSwitch(
+                        transportLabel = transportLabel,
+                        forceHardReload = primaryNeedsReload
+                    )
+                )
+
+                _secondaryWebStates.value.forEach { (wsId, state) ->
+                    val secNeedsReload = state.webError != null ||
+                        state.isShowingOfflineCache ||
+                        state.pageProgress in 1..99
+                    if (state.webError != null || state.isShowingOfflineCache) {
+                        updateSecondaryState(wsId) {
+                            it.copy(webError = null, isShowingOfflineCache = false)
                         }
+                    }
+                    getOrCreateSecondaryCommandFlow(wsId).tryEmit(
+                        WebViewCommand.RecoverFromNetworkSwitch(
+                            transportLabel = transportLabel,
+                            forceHardReload = secNeedsReload
+                        )
+                    )
+                }
 
-                        remoteConfigSyncer.syncConfig()
-                        val latestCfg = repository.getConfigSnapshot()
-                        val intervalMs = latestCfg.remoteControl.gpsIntervalSeconds.coerceAtLeast(3600) * 1000L
-                        val refTime = repository.getGpsReferenceUploadOrAnchorTime()
-                        val elapsed = if (refTime > 0L) System.currentTimeMillis() - refTime else 0L
-                        val hourlyDue = refTime > 0L && elapsed >= (intervalMs - 90_000L)
+                val currentCfg = repository.getConfigSnapshot()
+                if (!currentCfg.isCustomStoreBound) {
+                    if (event.reason == NetworkSwitchReason.RECONNECTED) {
+                        _snackbarMessages.tryEmit("ইন্টারনেট সংযোগ ফিরে এসেছে ($transportLabel)")
+                    }
+                    return@collectLatest
+                }
 
-                        var flushed = locationUploader.flushPendingLocations(forceAll = hourlyDue)
-                        if (hourlyDue && flushed == 0) {
-                            val sent = gpsCapturer.captureAndUploadIfAllowed(
-                                trigger = GpsUploadTrigger.HOURLY_SCHEDULE,
-                                isBackground = false
-                            )
-                            if (sent != null) flushed = 1
-                        }
+                remoteConfigSyncer.syncConfig()
+                val latestCfg = repository.getConfigSnapshot()
+                val intervalMs = latestCfg.remoteControl.gpsIntervalSeconds.coerceAtLeast(3600) * 1000L
+                val refTime = repository.getGpsReferenceUploadOrAnchorTime()
+                val elapsed = if (refTime > 0L) System.currentTimeMillis() - refTime else 0L
+                val hourlyDue = refTime > 0L && elapsed >= (intervalMs - 90_000L)
 
-                        runPollCycle(showSnackbarOnError = false)
+                var flushed = locationUploader.flushPendingLocations(forceAll = hourlyDue)
+                if (hourlyDue && flushed == 0) {
+                    val sent = gpsCapturer.captureAndUploadIfAllowed(
+                        trigger = GpsUploadTrigger.HOURLY_SCHEDULE,
+                        isBackground = false
+                    )
+                    if (sent != null) flushed = 1
+                }
+
+                runPollCycle(showSnackbarOnError = false)
+
+                when (event.reason) {
+                    NetworkSwitchReason.RECONNECTED -> {
                         _snackbarMessages.tryEmit(
                             if (flushed > 0) {
-                                "অনলাইন: $flushed টি সংরক্ষিত GPS/ডেটা সিঙ্ক হয়েছে"
+                                "অনলাইন ($transportLabel): $flushed টি সংরক্ষিত GPS/ডেটা সিঙ্ক হয়েছে"
                             } else {
-                                "ইন্টারনেট সংযোগ ফিরে এসেছে — অটো-সিঙ্ক সম্পন্ন"
+                                "ইন্টারনেট সংযোগ ফিরে এসেছে ($transportLabel) — অটো-সিঙ্ক সম্পন্ন"
                             }
                         )
                     }
+                    NetworkSwitchReason.TRANSPORT_CHANGED -> {
+                        _snackbarMessages.tryEmit(
+                            "নেটওয়ার্ক পরিবর্তন ($transportLabel) — সংযোগ ও ডেটা সিঙ্ক সম্পন্ন"
+                        )
+                    }
+                    NetworkSwitchReason.IP_OR_DNS_CHANGED,
+                    NetworkSwitchReason.VALIDATED_READY -> {
+                        // Silently recovered sockets, DNS, WebView & sync without noisy popups
+                    }
                 }
+            }
         }
     }
 
@@ -844,6 +911,22 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
                 val intervalMs = config.remoteControl.syncIntervalSeconds.coerceIn(10, 3600) * 1000L
                 delay(intervalMs)
             }
+        }
+    }
+
+    fun onAppForegrounded() {
+        refreshDeviceAndPermissionState()
+        val isNowOnline = networkMonitor.refreshNow()
+        if (isNowOnline && (_webError.value != null || _isShowingOfflineCache.value)) {
+            NetworkClientProvider.onNetworkChanged(getApplication())
+            _webError.value = null
+            _isShowingOfflineCache.value = false
+            _webViewCommands.tryEmit(
+                WebViewCommand.RecoverFromNetworkSwitch(
+                    transportLabel = networkMonitor.networkState.value.transport.label,
+                    forceHardReload = true
+                )
+            )
         }
     }
 
@@ -1021,6 +1104,7 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     fun reloadCurrentWebPage() {
+        NetworkClientProvider.onNetworkChanged(getApplication())
         networkMonitor.refreshNow()
         _webError.value = null
         _isShowingOfflineCache.value = false
@@ -1038,6 +1122,7 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     fun reloadSecondaryWebPage(workspaceId: String, fallbackUrl: String) {
+        NetworkClientProvider.onNetworkChanged(getApplication())
         networkMonitor.refreshNow()
         updateSecondaryState(workspaceId) { it.copy(webError = null, isShowingOfflineCache = false) }
         val target = _secondaryWebStates.value[workspaceId]?.currentUrl.orEmpty().ifBlank { fallbackUrl }
@@ -1362,6 +1447,7 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
 
     fun bindShopFromQrPayload(rawQr: String, onReadyToReboot: () -> Unit) {
         if (_shopBindingState.value.isLoading) return
+        if (uiState.value.config.isCustomStoreBound) return
         val extractedUrl = ShopHandshakeManager.extractStoreUrlFromQr(rawQr)
         if (extractedUrl.isNullOrBlank()) {
             _shopBindingState.value = ShopBindingUiState(
@@ -1376,6 +1462,16 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
     fun bindShopUrl(rawUrl: String, onReadyToReboot: () -> Unit) {
         if (_shopBindingState.value.isLoading) return
         viewModelScope.launch {
+            // Strict post-bind lock: once bound to an Admin Panel, never allow local re-binding
+            // from the device until the Admin Panel remotely disconnects this device.
+            if (repository.getConfigSnapshot().isCustomStoreBound) {
+                _shopBindingState.value = ShopBindingUiState(
+                    isLoading = false,
+                    errorMessage = "এই ফোনটি ইতিমধ্যেই অ্যাডমিন প্যানেলের সাথে লক করা আছে। প্যানেল থেকে ডিসকানেক্ট না করা পর্যন্ত পরিবর্তন করা যাবে না।"
+                )
+                return@launch
+            }
+            NetworkClientProvider.onNetworkChanged(getApplication())
             _shopBindingState.value = ShopBindingUiState(
                 isLoading = true,
                 errorMessage = null,
@@ -1424,26 +1520,6 @@ class BanglaStoreViewModel(application: Application) : AndroidViewModel(applicat
                     onReadyToReboot()
                 }
             }
-        }
-    }
-
-    fun resetShopBinding(onReadyToReboot: () -> Unit) {
-        if (_shopBindingState.value.isLoading) return
-        viewModelScope.launch {
-            _shopBindingState.value = ShopBindingUiState(
-                isLoading = true,
-                statusMessage = "শপ আনলিংক, ডেটা ক্লিয়ার ও অ্যাপ রিবুট হচ্ছে..."
-            )
-            DeviceDisconnectManager.executeFullResetAndWipe(
-                context = getApplication(),
-                repository = repository,
-                showNotification = false,
-                emitRebootEvent = false
-            )
-            _cachedPages.value = emptyList()
-            delay(200)
-            _shopBindingState.value = ShopBindingUiState(isLoading = false)
-            onReadyToReboot()
         }
     }
 

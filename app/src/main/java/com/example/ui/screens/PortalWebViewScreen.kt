@@ -83,6 +83,8 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 import com.example.R
 import com.example.location.LocationPermissionHelper
+import com.example.sync.NetworkClientProvider
+import com.example.sync.NetworkMonitor
 import com.example.sync.RemoteConfigSyncer
 import com.example.ui.WebViewCommand
 import com.example.webview.BanglaStoreBridge
@@ -129,8 +131,13 @@ fun PortalWebViewScreen(
     val context = LocalContext.current
     var pendingFileCallback by remember { mutableStateOf<ValueCallback<Array<Uri>>?>(null) }
     var lastFailedFallbackUrl by remember { mutableStateOf<String?>(null) }
+    var autoRetryCount by remember { mutableStateOf(0) }
+    var lastAutoRetryUrl by remember { mutableStateOf("") }
+    var pendingRetryRunnable by remember { mutableStateOf<Runnable?>(null) }
 
     val currentIsOnline by rememberUpdatedState(isOnline)
+    val currentWebError by rememberUpdatedState(webError)
+    val currentPageProgress by rememberUpdatedState(pageProgress)
     val currentIsShowingOfflineCache by rememberUpdatedState(isShowingOfflineCache)
     val currentOnManualRefresh by rememberUpdatedState(onManualRefresh)
     val currentOnErrorChanged by rememberUpdatedState(onErrorChanged)
@@ -238,6 +245,15 @@ fun PortalWebViewScreen(
                 }
 
                 override fun onPageFinished(view: WebView?, url: String?) {
+                    pendingRetryRunnable?.let { view?.removeCallbacks(it) }
+                    pendingRetryRunnable = null
+                    autoRetryCount = 0
+                    lastAutoRetryUrl = ""
+                    view?.settings?.cacheMode = if (currentIsOnline) {
+                        WebSettings.LOAD_DEFAULT
+                    } else {
+                        WebSettings.LOAD_CACHE_ELSE_NETWORK
+                    }
                     onProgressChanged(100)
                     onNavigationChanged(url, view?.canGoBack() ?: false)
                     swipeRefreshLayout.isRefreshing = false
@@ -308,10 +324,54 @@ fun PortalWebViewScreen(
                 ) {
                     if (request?.isForMainFrame == true) {
                         swipeRefreshLayout.isRefreshing = false
-                        onProgressChanged(100)
                         val failingUrl = request.url?.toString().orEmpty()
+                        val errorCode = error?.errorCode ?: WebViewClient.ERROR_UNKNOWN
+                        val desc = error?.description?.toString()
+                            ?: "ওয়েবসাইটের সাথে সংযোগ করা যাচ্ছে না"
+                        val networkReachable = currentIsOnline || NetworkMonitor.isAnyNetworkAvailable(context)
 
-                        if (!currentIsOnline &&
+                        // Automatically heal mid-switch Wi-Fi <-> Mobile Data / DNS / IP-conflict errors
+                        // without trapping the user on an error screen.
+                        if (networkReachable &&
+                            failingUrl.startsWith("http", ignoreCase = true) &&
+                            isRecoverableNetworkHandoffError(errorCode, desc)
+                        ) {
+                            val sameUrl = failingUrl.equals(lastAutoRetryUrl, ignoreCase = true)
+                            val nextAttempt = if (sameUrl) autoRetryCount + 1 else 1
+                            if (nextAttempt <= 3 && view != null) {
+                                lastAutoRetryUrl = failingUrl
+                                autoRetryCount = nextAttempt
+                                pendingRetryRunnable?.let { view.removeCallbacks(it) }
+                                NetworkClientProvider.onNetworkChanged(context)
+                                runCatching { CookieManager.getInstance().flush() }
+                                currentOnErrorChanged(null)
+                                currentOnOfflineCacheModeChanged(false)
+                                onProgressChanged(15)
+
+                                val retryDelayMs = when (nextAttempt) {
+                                    1 -> 650L
+                                    2 -> 1350L
+                                    else -> 2200L
+                                }
+                                val retryTask = Runnable {
+                                    NetworkClientProvider.onNetworkChanged(context)
+                                    runCatching {
+                                        view.setNetworkAvailable(false)
+                                        view.setNetworkAvailable(true)
+                                    }
+                                    view.settings.cacheMode = WebSettings.LOAD_NO_CACHE
+                                    view.stopLoading()
+                                    view.loadUrl(failingUrl, currentExtraHeadersProvider())
+                                }
+                                pendingRetryRunnable = retryTask
+                                view.postDelayed(retryTask, retryDelayMs)
+                                return
+                            }
+                        }
+
+                        onProgressChanged(100)
+
+                        if (!networkReachable &&
                             failingUrl.isNotBlank() &&
                             lastFailedFallbackUrl != failingUrl
                         ) {
@@ -332,8 +392,6 @@ fun PortalWebViewScreen(
                         }
 
                         currentOnOfflineCacheModeChanged(false)
-                        val desc = error?.description?.toString()
-                            ?: "ওয়েবসাইটের সাথে সংযোগ করা যাচ্ছে না"
                         currentOnErrorChanged(desc)
                     }
                 }
@@ -354,6 +412,7 @@ fun PortalWebViewScreen(
     }
 
     LaunchedEffect(isOnline) {
+        runCatching { webView.setNetworkAvailable(isOnline) }
         webView.settings.cacheMode = if (isOnline) {
             WebSettings.LOAD_DEFAULT
         } else {
@@ -391,17 +450,25 @@ fun PortalWebViewScreen(
         commands.collect { command ->
             when (command) {
                 is WebViewCommand.LoadUrl -> {
+                    pendingRetryRunnable?.let { webView.removeCallbacks(it) }
+                    pendingRetryRunnable = null
+                    autoRetryCount = 0
+                    lastAutoRetryUrl = ""
                     currentOnErrorChanged(null)
                     currentOnOfflineCacheModeChanged(false)
                     lastFailedFallbackUrl = null
-                    webView.settings.cacheMode = if (currentIsOnline) {
-                        WebSettings.LOAD_DEFAULT
+                    if (currentIsOnline) {
+                        NetworkClientProvider.onNetworkChanged(context)
+                        runCatching { webView.setNetworkAvailable(true) }
+                        webView.settings.cacheMode = WebSettings.LOAD_DEFAULT
                     } else {
-                        WebSettings.LOAD_CACHE_ELSE_NETWORK
+                        webView.settings.cacheMode = WebSettings.LOAD_CACHE_ELSE_NETWORK
                     }
                     webView.loadUrl(command.url, currentExtraHeadersProvider())
                 }
                 is WebViewCommand.LoadHtmlSnapshot -> {
+                    pendingRetryRunnable?.let { webView.removeCallbacks(it) }
+                    pendingRetryRunnable = null
                     currentOnErrorChanged(null)
                     currentOnOfflineCacheModeChanged(true)
                     webView.loadDataWithBaseURL(
@@ -412,17 +479,81 @@ fun PortalWebViewScreen(
                         command.baseUrl
                     )
                 }
+                is WebViewCommand.RecoverFromNetworkSwitch -> {
+                    pendingRetryRunnable?.let { webView.removeCallbacks(it) }
+                    pendingRetryRunnable = null
+                    autoRetryCount = 0
+                    lastAutoRetryUrl = ""
+                    lastFailedFallbackUrl = null
+                    NetworkClientProvider.onNetworkChanged(context)
+                    runCatching { CookieManager.getInstance().flush() }
+                    // Cycle Chromium WebView network state so dead sockets from the old
+                    // Wi-Fi/Mobile interface are dropped immediately and new requests use
+                    // the active network route & DNS.
+                    runCatching {
+                        webView.setNetworkAvailable(false)
+                        webView.setNetworkAvailable(true)
+                    }
+
+                    val activeUrl = webView.url.orEmpty()
+                    val shouldReloadPage = command.forceHardReload ||
+                        currentWebError != null ||
+                        currentIsShowingOfflineCache ||
+                        currentPageProgress in 1..99 ||
+                        activeUrl.isBlank() ||
+                        activeUrl.equals("about:blank", ignoreCase = true) ||
+                        activeUrl.startsWith("data:", ignoreCase = true)
+
+                    if (shouldReloadPage) {
+                        currentOnErrorChanged(null)
+                        currentOnOfflineCacheModeChanged(false)
+                        webView.stopLoading()
+                        webView.settings.cacheMode = WebSettings.LOAD_NO_CACHE
+                        val targetUrl = activeUrl.takeIf { it.startsWith("http", ignoreCase = true) }
+                            ?: initialUrl
+                        if (targetUrl.startsWith("http", ignoreCase = true)) {
+                            webView.loadUrl(targetUrl, currentExtraHeadersProvider())
+                        } else {
+                            webView.reload()
+                        }
+                    } else {
+                        webView.settings.cacheMode = WebSettings.LOAD_DEFAULT
+                        // Notify in-page JS/AJAX listeners that connectivity refreshed on the new network
+                        runCatching {
+                            webView.evaluateJavascript(
+                                "try { window.dispatchEvent(new Event('online')); } catch(e) {}",
+                                null
+                            )
+                        }
+                    }
+                }
                 WebViewCommand.Reload -> {
+                    pendingRetryRunnable?.let { webView.removeCallbacks(it) }
+                    pendingRetryRunnable = null
+                    autoRetryCount = 0
+                    lastAutoRetryUrl = ""
                     currentOnErrorChanged(null)
                     currentOnOfflineCacheModeChanged(false)
                     lastFailedFallbackUrl = null
                     swipeRefreshLayout.isRefreshing = true
-                    webView.settings.cacheMode = if (currentIsOnline) {
-                        WebSettings.LOAD_DEFAULT
+                    if (currentIsOnline) {
+                        NetworkClientProvider.onNetworkChanged(context)
+                        runCatching {
+                            webView.setNetworkAvailable(false)
+                            webView.setNetworkAvailable(true)
+                        }
+                        webView.settings.cacheMode = WebSettings.LOAD_NO_CACHE
+                        val activeUrl = webView.url.orEmpty()
+                        if (activeUrl.startsWith("http", ignoreCase = true)) {
+                            webView.stopLoading()
+                            webView.loadUrl(activeUrl, currentExtraHeadersProvider())
+                        } else {
+                            webView.reload()
+                        }
                     } else {
-                        WebSettings.LOAD_CACHE_ELSE_NETWORK
+                        webView.settings.cacheMode = WebSettings.LOAD_CACHE_ELSE_NETWORK
+                        webView.reload()
                     }
-                    webView.reload()
                 }
                 WebViewCommand.GoBack -> {
                     if (webView.canGoBack()) {
@@ -435,6 +566,8 @@ fun PortalWebViewScreen(
 
     DisposableEffect(Unit) {
         onDispose {
+            pendingRetryRunnable?.let { webView.removeCallbacks(it) }
+            pendingRetryRunnable = null
             pendingFileCallback?.onReceiveValue(null)
             swipeRefreshLayout.removeAllViews()
             webView.stopLoading()
@@ -814,4 +947,31 @@ private class DeliberateSwipeRefreshLayout(context: Context) : SwipeRefreshLayou
         val currentElapsed = SystemClock.uptimeMillis() - downTimeMs
         return maxOf(lastTriggerPullDurationMs, currentElapsed) >= minRefreshHoldMs
     }
+}
+
+private fun isRecoverableNetworkHandoffError(errorCode: Int, description: String): Boolean {
+    if (errorCode == WebViewClient.ERROR_HOST_LOOKUP ||
+        errorCode == WebViewClient.ERROR_CONNECT ||
+        errorCode == WebViewClient.ERROR_IO ||
+        errorCode == WebViewClient.ERROR_TIMEOUT ||
+        errorCode == WebViewClient.ERROR_FAILED_SSL_HANDSHAKE ||
+        errorCode == WebViewClient.ERROR_TOO_MANY_REQUESTS
+    ) {
+        return true
+    }
+    val upper = description.uppercase()
+    return upper.contains("ERR_NETWORK_CHANGED") ||
+        upper.contains("ERR_INTERNET_DISCONNECTED") ||
+        upper.contains("ERR_CONNECTION_RESET") ||
+        upper.contains("ERR_CONNECTION_ABORTED") ||
+        upper.contains("ERR_CONNECTION_CLOSED") ||
+        upper.contains("ERR_CONNECTION_REFUSED") ||
+        upper.contains("ERR_CONNECTION_TIMED_OUT") ||
+        upper.contains("ERR_TIMED_OUT") ||
+        upper.contains("ERR_NAME_NOT_RESOLVED") ||
+        upper.contains("ERR_ADDRESS_UNREACHABLE") ||
+        upper.contains("ERR_QUIC_PROTOCOL_ERROR") ||
+        upper.contains("ERR_SOCKET_NOT_CONNECTED") ||
+        upper.contains("ERR_NETWORK_ACCESS_DENIED") ||
+        upper.contains("ERR_SSL_PROTOCOL_ERROR")
 }

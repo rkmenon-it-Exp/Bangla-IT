@@ -51,10 +51,12 @@ class ShopHandshakeManager(
     private val context: Context,
     private val repository: StorePreferencesRepository
 ) {
-    private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(12, TimeUnit.SECONDS)
-        .readTimeout(15, TimeUnit.SECONDS)
-        .build()
+    private val httpClient: OkHttpClient
+        get() = NetworkClientProvider.getClientWithTimeouts(
+            context = context,
+            connectSeconds = 12L,
+            readSeconds = 15L
+        )
 
     suspend fun performHandshake(rawStoreUrl: String): ShopHandshakeResult = withContext(Dispatchers.IO) {
         val normalizedBase = normalizeStoreBaseUrl(rawStoreUrl)

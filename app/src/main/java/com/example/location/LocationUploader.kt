@@ -15,6 +15,7 @@ import com.example.model.LocationSnapshot
 import com.example.sync.DeviceDisconnectManager
 import com.example.sync.DeviceTelemetryHelper
 import com.example.sync.ImmediateSyncWorker
+import com.example.sync.NetworkClientProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -25,16 +26,13 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
-import java.util.concurrent.TimeUnit
 
 class LocationUploader(
     private val context: Context,
     private val repository: StorePreferencesRepository
 ) {
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(12, TimeUnit.SECONDS)
-        .build()
+    private val client: OkHttpClient
+        get() = NetworkClientProvider.getClient(context)
 
     /**
      * Collects GPS data locally when offline (or app closed & offline) without attempting network I/O,

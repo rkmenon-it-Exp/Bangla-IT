@@ -35,10 +35,8 @@ class NotificationPoller(
     private val context: Context,
     private val repository: StorePreferencesRepository
 ) {
-    private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(12, TimeUnit.SECONDS)
-        .build()
+    private val httpClient: OkHttpClient
+        get() = NetworkClientProvider.getClient(context)
 
     suspend fun pollOnce(showSystemNotifications: Boolean = true): PollSyncResult = withContext(Dispatchers.IO) {
         val config = repository.getConfigSnapshot()
